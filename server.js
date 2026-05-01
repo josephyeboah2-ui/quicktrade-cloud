@@ -1,0 +1,1294 @@
+// server.js
+// QuickTrade REAL MONEY backend using SnapTrade
+// - Serves:
+//     GET  /                               -> health check
+//     GET  /api/quote/:symbol              -> real quote via SnapTrade
+//     GET  /api/holdings                   -> REAL holdings + cash via SnapTrade
+//     POST /api/order                      -> main endpoint used by panel/hotkeys
+//     POST /api/trade                      -> legacy endpoint
+//     GET  /api/snaptrade/connect-portal   -> connection portal (no broker hard-coded)
+//     GET  /api/snaptrade/connect-wealthsimple -> same as connect-portal (alias)
+//     GET  /api/snaptrade/accounts         -> list linked user accounts (not implemented here)
+//     GET  /api/market-clock               -> exchange session + recommended order type
+
+require("dotenv").config();
+
+// --- GLOBAL ERROR HANDLERS (must be first!) ---
+process.on("unhandledRejection", (reason) => {
+  console.error("[QuickTrade] Unhandled Promise Rejection (server stays alive):", reason?.message || reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[QuickTrade] Uncaught Exception (server stays alive):", err?.message || err);
+});
+
+const express = require("express");
+const bodyParser = require("body-parser");
+const cors = require("cors");
+const { Snaptrade } = require("snaptrade-typescript-sdk");
+
+// -------- Alpaca Market Data (signals only) --------
+const { start: startAlpacaWS, subscribe: alpacaSubscribe } = require("./market/alpacaStream");
+const { onQuote, onTrade, onBar } = require("./market/signalsEngine");
+const { makeSignalsRouter } = require("./market/signals.routes");
+const { setWatchlist } = require("./market/signalsStore");
+
+
+// ---------------- ENV ----------------
+
+const CLIENT_ID = process.env.SNAPTRADE_CLIENT_ID;
+const CONSUMER_KEY = process.env.SNAPTRADE_CONSUMER_KEY;
+const USER_ID = process.env.SNAPTRADE_USER_ID;
+const USER_SECRET = process.env.SNAPTRADE_USER_SECRET;
+const ACCOUNT_ID = process.env.SNAPTRADE_ACCOUNT_ID;
+const BROKERAGE_AUTH_ID = process.env.SNAPTRADE_BROKERAGE_AUTH_ID;
+
+console.log("=== QuickTrade SnapTrade ENV CHECK ===");
+console.log("SNAPTRADE_CLIENT_ID:", CLIENT_ID ? "OK" : "MISSING");
+console.log("SNAPTRADE_CONSUMER_KEY:", CONSUMER_KEY ? "OK" : "MISSING");
+console.log("SNAPTRADE_USER_ID:", USER_ID ? "OK" : "MISSING");
+console.log("SNAPTRADE_USER_SECRET:", USER_SECRET ? "OK" : "MISSING");
+console.log("SNAPTRADE_ACCOUNT_ID:", ACCOUNT_ID ? "OK" : "MISSING");
+console.log("SNAPTRADE_BROKERAGE_AUTH_ID:", BROKERAGE_AUTH_ID ? "OK" : "MISSING");
+console.log("======================================");
+
+// ------------- INIT SNAPTRADE CLIENT -------------
+
+const snaptrade = new Snaptrade({
+  clientId: CLIENT_ID,
+  consumerKey: CONSUMER_KEY,
+});
+
+// ------------- EXPRESS SETUP -------------
+
+const app = express();
+
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST"],
+    allowedHeaders: ["Content-Type"],
+  })
+);
+
+app.use(bodyParser.json());
+
+// -------- Signals API (read-only, no trading) --------
+app.use(
+  makeSignalsRouter({
+    onWatchlistChanged: (symbols) => alpacaSubscribe(symbols),
+  })
+);
+
+// health check
+app.get("/", (req, res) => {
+  res.json({ ok: true, message: "QuickTrade SnapTrade backend alive" });
+});
+
+// ------------- TOP MOVERS (Gainers 3%+) -------------
+const ALPACA_KEY = process.env.ALPACA_API_KEY || "";
+const ALPACA_SECRET = process.env.ALPACA_API_SECRET || "";
+const hasAlpacaKeys = ALPACA_KEY && ALPACA_KEY !== "your_key_here";
+
+app.get("/api/top-movers", async (req, res) => {
+  try {
+    const minGain = parseFloat(req.query.min || "3"); // default 3%
+    const limit = parseInt(req.query.limit || "5");    // default top 5
+
+    if (hasAlpacaKeys) {
+      // Use Alpaca screener API
+      const fetch = (await import("node-fetch")).default;
+      const url = "https://data.alpaca.markets/v1beta1/screener/stocks/movers?top=20";
+      const resp = await fetch(url, {
+        headers: {
+          "APCA-API-KEY-ID": ALPACA_KEY,
+          "APCA-API-SECRET-KEY": ALPACA_SECRET,
+        },
+      });
+      const data = await resp.json();
+      const gainers = (data.gainers || [])
+        .filter(g => g.percent_change >= minGain)
+        .slice(0, limit)
+        .map(g => ({
+          symbol: g.symbol,
+          price: g.price,
+          change: g.change,
+          changePct: g.percent_change,
+          volume: g.volume || null,
+        }));
+
+      return res.json({ ok: true, source: "alpaca", gainers });
+    }
+
+    // Fallback: use internal signal store data
+    const allSignals = require("./market/signalsStore").getAll();
+    const gainers = allSignals
+      .filter(s => s.last && s.vwap && s.last > s.vwap)
+      .map(s => ({
+        symbol: s.symbol,
+        price: s.last,
+        changePct: s.vwap > 0 ? ((s.last - s.vwap) / s.vwap * 100) : 0,
+        signal: s.signal,
+        confidence: s.confidence,
+      }))
+      .filter(g => g.changePct >= minGain)
+      .sort((a, b) => b.changePct - a.changePct)
+      .slice(0, limit);
+
+    res.json({ ok: true, source: "internal", gainers });
+  } catch (err) {
+    console.error("[QuickTrade] Top movers error:", err.message);
+    res.json({ ok: true, source: "error", gainers: [], error: err.message });
+  }
+});
+
+// ------------- LIST CONNECTIONS (BROKERAGE AUTHORIZATIONS) -------------
+// ✅ Option B: backend endpoint your extension can call to see why trading is blocked
+// Uses: GET https://api.snaptrade.com/api/v1/authorizations :contentReference[oaicite:1]{index=1}
+app.get("/api/snaptrade/accounts", async (req, res) => {
+  console.log("[QuickTrade] /api/snaptrade/accounts");
+
+  try {
+    if (!CLIENT_ID || !CONSUMER_KEY || !USER_ID || !USER_SECRET) {
+      return res.status(500).json({
+        ok: false,
+        error: "Missing SNAPTRADE_CLIENT_ID / CONSUMER_KEY / USER_ID / USER_SECRET",
+      });
+    }
+
+    // ✅ Correct SDK call:
+    const resp = await snaptrade.connections.listBrokerageAuthorizations({
+      userId: USER_ID,
+      userSecret: USER_SECRET,
+    });
+
+    const list = resp.data || resp || [];
+
+    // Keep response clean + useful for debugging in the extension
+    const connections = (Array.isArray(list) ? list : []).map((c) => ({
+      id: c.id,
+      name: c.name,
+      type: c.type, // "read" | "trade"
+      disabled: !!c.disabled,
+      disabled_date: c.disabled_date || null,
+      brokerage: {
+        id: c.brokerage?.id,
+        slug: c.brokerage?.slug,
+        name: c.brokerage?.name,
+        display_name: c.brokerage?.display_name,
+        maintenance_mode: !!c.brokerage?.maintenance_mode,
+        allows_trading: c.brokerage?.allows_trading ?? null,
+        enabled: c.brokerage?.enabled ?? null,
+      },
+    }));
+
+    // Helpful summary flags
+    const anyDisabled = connections.some((c) => c.disabled);
+    const anyMaintenance = connections.some((c) => c.brokerage.maintenance_mode);
+
+    return res.json({
+      ok: true,
+      anyDisabled,
+      anyMaintenance,
+      connections,
+    });
+  } catch (err) {
+    const safeMessage = extractSafeError(err);
+    return res.status(500).json({ ok: false, error: safeMessage });
+  }
+});
+
+// ------------- HELPERS -------------
+
+function ensureEnv() {
+  if (!CLIENT_ID || !CONSUMER_KEY || !USER_ID || !USER_SECRET || !ACCOUNT_ID) {
+    throw new Error(
+      "Backend missing SnapTrade env vars. Check SNAPTRADE_* values in .env (including SNAPTRADE_ACCOUNT_ID)."
+    );
+  }
+}
+
+function mapOrderType(frontType) {
+  const t = String(frontType || "").toLowerCase();
+  if (t === "market") return "Market";
+  if (t === "limit") return "Limit";
+  if (t === "stop") return "Stop";
+  if (t === "stop_limit" || t === "stoplimit") return "StopLimit";
+  return "Market";
+}
+
+function extractSafeError(err) {
+  console.error("[QuickTrade] RAW ERROR FROM SNAPTRADE:", err);
+
+  // 🔍 Special handling for SnapTrade "inactive security" (code 1146)
+  try {
+    const body =
+      err?.responseBody ||
+      err?.body ||
+      err?.response?.data ||
+      null;
+
+    const code = body?.code || body?.status_code || err?.code;
+    const detail = body?.detail || err?.message || "";
+
+    // If SnapTrade says the underlying security is inactive
+    if (String(code) === "1146" || /inactive as of/i.test(detail || "")) {
+      return (
+        "QT_BACKEND_ERROR: This symbol is currently marked INACTIVE " +
+        "on SnapTrade's side, so QuickTrade can't send live orders for it. " +
+        "You may still be able to trade it directly in your broker's app. " +
+        (detail ? ` (${detail}) (code 1146)` : " (code 1146)")
+      );
+    }
+
+    // Generic SnapTrade error with detail
+    if (body && detail) {
+      let safeMessage = `QT_BACKEND_ERROR: ${detail}`;
+      if (code) {
+        safeMessage += ` (code ${code})`;
+      }
+      return safeMessage;
+    }
+
+    if (err && typeof err === "object") {
+      if (err.message) return err.message;
+    }
+  } catch (e) {
+    console.warn("[QuickTrade] extractSafeError secondary error:", e);
+  }
+
+  return "Unknown error while placing order.";
+}
+// ---------- MONEY FORMATTER ----------
+function formatMoney(num) {
+  const v = Number(num);
+  if (!isFinite(v)) return 0;
+  return Number(v.toFixed(2));
+}
+
+
+// ---------------- MARKET CLOCK (EASTERN TIME) ----------------
+
+/**
+ * Convert "now" to America/New_York and figure out:
+ * - is regular session open
+ * - is pre-market / post-market
+ * - recommended order type for frontend (market vs limit)
+ *
+ * We assume US equities for now (NYSE/NASDAQ):
+ *  - Regular: 09:30–16:00 ET
+ *  - Pre:     08:00–09:30 ET
+ *  - Post:    16:00–20:00 ET
+ */
+function getMarketClock() {
+  const now = new Date();
+  const nyString = now.toLocaleString("en-US", {
+    timeZone: "America/New_York",
+  });
+  const nyNow = new Date(nyString);
+
+  const day = nyNow.getDay(); // 0=Sun, 6=Sat
+  const isWeekday = day >= 1 && day <= 5;
+
+  const hours = nyNow.getHours();
+  const minutes = nyNow.getMinutes();
+  const totalMin = hours * 60 + minutes;
+
+  const PRE_OPEN = 8 * 60; // 08:00
+  const REG_OPEN = 9 * 60 + 30; // 09:30
+  const REG_CLOSE = 16 * 60; // 16:00
+  const POST_CLOSE = 20 * 60; // 20:00
+
+  let session = "CLOSED";
+  let isOpenRegular = false;
+  let isExtended = false;
+
+  if (isWeekday) {
+    if (totalMin >= REG_OPEN && totalMin < REG_CLOSE) {
+      session = "REGULAR";
+      isOpenRegular = true;
+    } else if (totalMin >= PRE_OPEN && totalMin < REG_OPEN) {
+      session = "PRE";
+      isExtended = true;
+    } else if (totalMin >= REG_CLOSE && totalMin < POST_CLOSE) {
+      session = "POST";
+      isExtended = true;
+    }
+  }
+
+  const isClosed = !isOpenRegular && !isExtended;
+
+  // Frontend can use this to auto-toggle order type:
+  //  - REGULAR  -> market + limit allowed
+  //  - PRE/POST -> limit recommended
+  const recommendedOrderType = isOpenRegular ? "market" : "limit";
+
+  return {
+    exchange: "US_EQUITIES",
+    timeZone: "America/New_York",
+    isoNow: nyNow.toISOString(),
+    session, // "REGULAR" | "PRE" | "POST" | "CLOSED"
+    isOpenRegular,
+    isExtended,
+    isClosed,
+    recommendedOrderType,
+  };
+}
+
+// For the overlay to poll and auto-switch the order type UI
+app.get("/api/market-clock", (req, res) => {
+  try {
+    const clock = getMarketClock();
+    res.json({ ok: true, clock });
+  } catch (err) {
+    console.error("[QuickTrade] /api/market-clock error:", err);
+    res.status(500).json({ ok: false, error: "Failed to compute market clock." });
+  }
+});
+
+// ---------------- SYMBOL RESOLVER (SMART VERSION USING SNAPTRADE) ----------------
+
+/**
+ * Resolve what we actually send to SnapTrade.
+ *
+ * Uses SnapTrade Reference Data "Search symbols" endpoint to find the proper
+ * trading symbol (e.g. SIS → SIS.TO, VAB → VAB.TO, etc).
+ */
+const symbolCache = new Map();
+
+// Resolve ticker -> SnapTrade SYMBOL ID (UUID) for quotes
+const quoteSymbolCache = new Map();
+
+async function resolveQuoteSymbolId(rawSymbol) {
+  const upper = String(rawSymbol || "").toUpperCase().trim();
+  if (!upper) throw new Error("Missing symbol");
+
+  if (quoteSymbolCache.has(upper)) {
+    return quoteSymbolCache.get(upper);
+  }
+
+  const resp = await snaptrade.referenceData.getSymbols({
+    substring: upper,
+  });
+
+  const list = resp.data || [];
+
+  if (!Array.isArray(list) || list.length === 0) {
+    throw new Error(`No SnapTrade symbol found for ${upper}`);
+  }
+
+  // Prefer exact raw_symbol match
+  const best =
+    list.find((s) => String(s.raw_symbol || "").toUpperCase() === upper) ||
+    list[0];
+
+  if (!best || !best.id) {
+    throw new Error(`Symbol ID missing for ${upper}`);
+  }
+
+  quoteSymbolCache.set(upper, best.id);
+  return best.id;
+}
+
+async function resolveEffectiveSymbol(rawSymbol) {
+  if (!rawSymbol) {
+    throw new Error("Missing symbol for resolution.");
+  }
+
+  const upper = String(rawSymbol).toUpperCase().trim();
+
+  // If it already has a suffix (e.g. "SIS.TO", "AAPL", "AMZN"), just uppercase & use it.
+  if (upper.includes(".")) {
+    return upper;
+  }
+
+  if (symbolCache.has(upper)) {
+    return symbolCache.get(upper);
+  }
+
+  try {
+    const resp = await snaptrade.referenceData.getSymbols({
+      substring: upper,
+    });
+
+    const list = resp.data || resp || [];
+
+    if (Array.isArray(list) && list.length > 0) {
+      let best = list.find((s) => {
+        if (!s || !s.raw_symbol) return false;
+        return String(s.raw_symbol).toUpperCase() === upper;
+      });
+
+      if (!best) best = list[0];
+
+      const eff =
+        best && (best.symbol || best.raw_symbol)
+          ? String(best.symbol || best.raw_symbol)
+          : upper;
+
+      const finalSymbol = eff.toUpperCase();
+      symbolCache.set(upper, finalSymbol);
+
+      console.log("[QuickTrade] Resolved symbol:", {
+        input: rawSymbol,
+        resolved: finalSymbol,
+      });
+
+      return finalSymbol;
+    }
+
+    console.warn(
+      "[QuickTrade] resolveEffectiveSymbol: no matches from SnapTrade for",
+      upper
+    );
+    return upper;
+  } catch (e) {
+    console.error(
+      "[QuickTrade] resolveEffectiveSymbol error (falling back to raw):",
+      e
+    );
+    return upper;
+  }
+}
+
+
+// ---------------- placeEquityOrder ----------------
+
+async function placeEquityOrder({
+  action, // "buy" | "sell"
+  symbol,
+  qty,
+  orderType, // "market" | "limit" | "stop" | "stop_limit"
+  limitPrice,
+  stopPrice,
+}) {
+  ensureEnv();
+
+  if (!symbol || typeof symbol !== "string") {
+    throw new Error("Missing or invalid symbol.");
+  }
+
+  if (!action || !["buy", "sell", "BUY", "SELL"].includes(String(action))) {
+    throw new Error("Invalid action. Must be 'buy' or 'sell'.");
+  }
+
+  const units = Number(qty);
+  if (!units || units <= 0) {
+    throw new Error("Invalid share amount.");
+  }
+
+  const snapAction = String(action).toUpperCase() === "BUY" ? "BUY" : "SELL";
+  const snapOrderType = mapOrderType(orderType);
+
+  // 🔔 Market clock: block Market orders outside regular hours
+  const clock = getMarketClock();
+  if (!clock.isOpenRegular && snapOrderType === "Market") {
+    throw new Error(
+      "Market orders are only allowed during regular hours (09:30–16:00 ET). Switch to a Limit order."
+    );
+  }
+
+  const isMarket = snapOrderType === "Market";
+
+  const px =
+    limitPrice !== undefined && limitPrice !== null
+      ? Number(limitPrice)
+      : null;
+  const sp =
+    stopPrice !== undefined && stopPrice !== null ? Number(stopPrice) : null;
+
+  if (!isMarket && (px === null || isNaN(px) || px <= 0)) {
+    throw new Error("Limit/Stop/StopLimit order requires a valid price.");
+  }
+
+  // Resolve symbol to what SnapTrade actually expects (e.g. SIS → SIS.TO)
+  const effectiveSymbol = await resolveEffectiveSymbol(symbol);
+
+  // Simple mapping for trading_session:
+  //  - REGULAR -> "REGULAR"
+  //  - PRE/POST -> still "REGULAR" for now (SnapTrade will route if supported)
+  const tradingSession = clock.isOpenRegular ? "REGULAR" : "REGULAR";
+
+  const payload = {
+    userId: USER_ID,
+    userSecret: USER_SECRET,
+    account_id: ACCOUNT_ID,
+    action: snapAction,
+    symbol: effectiveSymbol,
+    order_type: snapOrderType,
+    time_in_force: "Day",
+    trading_session: tradingSession,
+    units,
+  };
+
+  if (snapOrderType === "Limit" || snapOrderType === "StopLimit") {
+    payload.price = px;
+  }
+  if (snapOrderType === "Stop" || snapOrderType === "StopLimit") {
+    payload.stop = sp;
+  }
+
+  console.log("[QuickTrade] placeEquityOrder payload:", JSON.stringify(payload, null, 2));
+
+  const orderResponse = await snaptrade.trading.placeForceOrder(payload);
+
+  console.log(
+    "[QuickTrade] SnapTrade order success:",
+    orderResponse.data || orderResponse
+  );
+
+  return orderResponse.data || orderResponse;
+}
+// ------------- SNAPTRADE USER REGISTRATION -------------
+
+app.post("/api/snaptrade/register-user", async (req, res) => {
+  try {
+    const userId = (req.body && req.body.userId) || USER_ID || "QTrader12345";
+    console.log("[QuickTrade] Registering SnapTrade user:", userId);
+
+    const response = await snaptrade.authentication.registerSnapTradeUser({
+      userId: userId,
+    });
+
+    console.log("[QuickTrade] Register response:", response.data);
+
+    res.json({
+      ok: true,
+      userId: response.data.userId || userId,
+      userSecret: response.data.userSecret,
+    });
+  } catch (err) {
+    console.error("[QuickTrade] Register error:", err.response?.data || err.message);
+    const safeMessage = extractSafeError(err);
+    res.status(500).json({ ok: false, error: safeMessage });
+  }
+});
+
+app.post("/api/snaptrade/reset-user-secret", async (req, res) => {
+  try {
+    const userId = (req.body && req.body.userId) || USER_ID || "QTrader12345";
+    const userSecret = (req.body && req.body.userSecret) || USER_SECRET;
+    console.log("[QuickTrade] Resetting user secret for:", userId);
+
+    const response = await snaptrade.authentication.resetSnapTradeUserSecret({
+      userId: userId,
+      userSecret: userSecret,
+    });
+
+    console.log("[QuickTrade] Reset secret response:", response.data);
+
+    res.json({
+      ok: true,
+      userId: response.data.userId || userId,
+      userSecret: response.data.userSecret,
+    });
+  } catch (err) {
+    console.error("[QuickTrade] Reset secret error:", err.response?.data || err.message);
+    const safeMessage = extractSafeError(err);
+    res.status(500).json({ ok: false, error: safeMessage });
+  }
+});
+
+// ------------- SNAPTRADE PORTAL (no broker hard-coded) -------------
+
+app.get("/api/snaptrade/connect-portal", async (req, res) => {
+  try {
+    if (!CLIENT_ID || !CONSUMER_KEY || !USER_ID || !USER_SECRET) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "Missing SNAPTRADE_CLIENT_ID / CONSUMER_KEY / USER_ID / USER_SECRET",
+      });
+    }
+
+    // Allow version override via ?version=v3 or ?version=v4 for testing
+    const portalVersion = req.query.version || "v3";
+
+    const response = await snaptrade.authentication.loginSnapTradeUser({
+      userId: USER_ID,
+      userSecret: USER_SECRET,
+      connectionType: "trade",
+      broker: "WEALTHSIMPLETRADE",
+    });
+
+    console.log("[QuickTrade] Created connection portal:", response.data);
+
+    res.json({
+      ok: true,
+      redirectURI: response.data.redirectURI,
+      sessionId: response.data.sessionId,
+    });
+  } catch (err) {
+    console.error(
+      "[QuickTrade] Error creating connect link:",
+      err.response?.data || err
+    );
+    const safeMessage = extractSafeError(err);
+    res.status(500).json({ ok: false, error: safeMessage });
+  }
+});
+
+// alias route specifically called by your frontend / manual tests
+app.get("/api/snaptrade/connect-wealthsimple", async (req, res) => {
+  try {
+    if (!CLIENT_ID || !CONSUMER_KEY || !USER_ID || !USER_SECRET) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "Missing SNAPTRADE_CLIENT_ID / CONSUMER_KEY / USER_ID / USER_SECRET",
+      });
+    }
+
+    if (!BROKERAGE_AUTH_ID) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "Missing SNAPTRADE_BROKERAGE_AUTH_ID in .env (use brokerage_authorization from /api/snaptrade/accounts)",
+      });
+    }
+
+    const response = await snaptrade.authentication.loginSnapTradeUser({
+      userId: USER_ID,
+      userSecret: USER_SECRET,
+      reconnect: BROKERAGE_AUTH_ID,
+      connectionType: "trade",
+      darkMode: true,
+      showCloseButton: true,
+      connectionPortalVersion: "v4",
+    });
+
+    console.log(
+      "[QuickTrade] Created trading RECONNECT portal (wealthsimple):",
+      response.data
+    );
+
+    res.json({
+      ok: true,
+      redirectURI: response.data.redirectURI,
+      sessionId: response.data.sessionId,
+    });
+  } catch (err) {
+    console.error(
+      "[QuickTrade] Error creating wealthsimple reconnect link:",
+      err.response?.data || err
+    );
+    const safeMessage = extractSafeError(err);
+    res.status(500).json({ ok: false, error: safeMessage });
+  }
+});
+
+// ------------- DELETE STALE CONNECTION -------------
+
+app.delete("/api/snaptrade/connection", async (req, res) => {
+  console.log("[QuickTrade] DELETE /api/snaptrade/connection");
+
+  try {
+    if (!CLIENT_ID || !CONSUMER_KEY || !USER_ID || !USER_SECRET) {
+      return res.status(500).json({
+        ok: false,
+        error: "Missing SnapTrade credentials in .env",
+      });
+    }
+
+    // Use the auth ID from the request body, or fall back to the .env value
+    const authId = (req.body && req.body.authorizationId) || BROKERAGE_AUTH_ID;
+
+    if (!authId) {
+      return res.status(400).json({
+        ok: false,
+        error: "No authorizationId provided and SNAPTRADE_BROKERAGE_AUTH_ID not set.",
+      });
+    }
+
+    await snaptrade.connections.removeBrokerageAuthorization({
+      userId: USER_ID,
+      userSecret: USER_SECRET,
+      authorizationId: authId,
+    });
+
+    console.log("[QuickTrade] Deleted brokerage connection:", authId);
+
+    res.json({ ok: true, deleted: authId });
+  } catch (err) {
+    console.error("[QuickTrade] Error deleting connection:", err.response?.data || err);
+    const safeMessage = extractSafeError(err);
+    res.status(500).json({ ok: false, error: safeMessage });
+  }
+});
+
+// ------------- REAL HOLDINGS ENDPOINT -------------
+
+app.get("/api/holdings", async (req, res) => {
+  console.log("[QuickTrade] /api/holdings (REAL)");
+
+  try {
+    ensureEnv();
+
+    // Pre-check: make sure we have an active connection before querying holdings
+    try {
+      const connResp = await snaptrade.connections.listBrokerageAuthorizations({
+        userId: USER_ID,
+        userSecret: USER_SECRET,
+      });
+      const connList = Array.isArray(connResp.data) ? connResp.data : [];
+      const activeConns = connList.filter(c => !c.disabled);
+
+      if (activeConns.length === 0) {
+        return res.json({
+          ok: false,
+          connected: false,
+          error: "No active brokerage connection. Click Connect to link your broker.",
+        });
+      }
+    } catch (connErr) {
+      console.warn("[QuickTrade] Could not check connections:", connErr.message);
+      // Continue anyway — the holdings call will fail with a clear error if needed
+    }
+
+    const resp = await snaptrade.accountInformation.getUserHoldings({
+      userId: USER_ID,
+      userSecret: USER_SECRET,
+      accountId: ACCOUNT_ID,
+    });
+
+    const data = resp.data || resp;
+
+    const balances = data.balances || [];
+    const positions = data.positions || [];
+    const orders = data.orders || [];
+
+    const cashByCurrency = {};
+    let cashTotal = 0;
+
+    for (const b of balances) {
+      if (!b) continue;
+
+      const currency =
+        (b.currency && (b.currency.code || b.currency)) ||
+        b.currency ||
+        "UNKNOWN";
+
+      const cashVal =
+        typeof b.cash === "number"
+          ? b.cash
+          : typeof b.total === "number"
+          ? b.total
+          : 0;
+
+      if (!cashByCurrency[currency]) {
+        cashByCurrency[currency] = 0;
+      }
+
+      cashByCurrency[currency] += cashVal;
+      cashTotal += cashVal;
+    }
+
+    const cashUsd = cashByCurrency.USD ? formatMoney(cashByCurrency.USD) : 0;
+
+    const holdings = positions.map((pos) => {
+      const sym = pos.symbol?.symbol;
+      const rawSymbol =
+        sym?.raw_symbol || sym?.symbol || pos.symbol?.local_id || "UNKNOWN";
+      const desc =
+        sym?.description ||
+        pos.symbol?.description ||
+        rawSymbol;
+
+      const qty = Number(pos.units || 0);
+      const price = Number(pos.price || 0);
+      const value = qty * price;
+
+      const avg = pos.average_purchase_price
+        ? Number(pos.average_purchase_price)
+        : null;
+
+      let pnlPct = 0;
+      if (avg && avg > 0 && qty > 0) {
+        const cost = avg * qty;
+        const pnlMoney = value - cost;
+        pnlPct = (pnlMoney / cost) * 100;
+      } else if (typeof pos.open_pnl === "number" && value > 0) {
+        const pnlMoney = pos.open_pnl;
+        const cost = value - pnlMoney;
+        if (cost > 0) {
+          pnlPct = (pnlMoney / cost) * 100;
+        }
+      }
+
+      return {
+        symbol: rawSymbol,
+        name: desc,
+        quantity: qty,
+        price: formatMoney(price),
+        value: formatMoney(value),
+        pnlPct: formatMoney(pnlPct),
+      };
+    });
+
+    let invested = holdings.reduce((sum, h) => sum + (h.value || 0), 0);
+    let total = invested + cashTotal;
+
+    const accountTotal = data.account?.balance?.total?.amount;
+    if (typeof accountTotal === "number") {
+      total = accountTotal;
+    }
+
+    const pendingStatuses = new Set([
+      "PENDING",
+      "ACCEPTED",
+      "PARTIAL",
+      "PARTIAL_CANCELED",
+      "QUEUED",
+      "TRIGGERED",
+      "ACTIVATED",
+      "REPLACE_PENDING",
+      "CANCEL_PENDING",
+    ]);
+
+    const pendingOrders = (orders || [])
+      .filter((o) => pendingStatuses.has(String(o.status || "").toUpperCase()))
+      .map((o) => {
+        const us = o.universal_symbol;
+        const raw =
+          us?.raw_symbol || us?.symbol || "UNKNOWN";
+        return {
+          symbol: raw,
+          side: o.action || null,
+          quantity: o.open_quantity || o.total_quantity || null,
+          orderType: o.order_type || null,
+          limitPrice: o.limit_price || null,
+          status: o.status || null,
+          accountId: ACCOUNT_ID,
+          brokerageOrderId: o.brokerage_order_id || "",
+        };
+      });
+
+    let recentActivity = [];
+    if (orders && orders.length > 0) {
+      const last = orders[orders.length - 1];
+      const us = last.universal_symbol;
+      const raw =
+        us?.raw_symbol || us?.symbol || "UNKNOWN";
+      recentActivity.push({
+        symbol: raw,
+        side: last.action || null,
+        quantity: last.total_quantity || null,
+        status: last.status || null,
+      });
+    }
+
+    // Also attach current market clock so frontend can show status
+    const clock = getMarketClock();
+
+    res.json({
+  ok: true,
+  connected: true,
+  total: formatMoney(total),
+  cash: formatMoney(cashTotal),
+  cashByCurrency: Object.fromEntries(
+    Object.entries(cashByCurrency).map(([k, v]) => [k, formatMoney(v)])
+  ),
+  cashUsd,
+  invested: formatMoney(invested),
+  pnlMoney: 0,
+  pnlPct: 0,
+  holdings,
+  pendingOrders,
+  recentActivity,
+  clock,
+});
+
+ } catch (err) {
+  console.error("[QuickTrade] /api/holdings error:", err);
+  const safeMessage = extractSafeError(err);
+
+  // return 200 so the extension doesn't get stuck in "500 spam" loops
+  return res.json({
+    ok: false,
+    connected: false,
+    error: safeMessage,
+  });
+}
+
+});
+
+// ------------- QUOTE ENDPOINT -------------
+//
+// IMPORTANT:
+// - Never throw 500 to the extension repeatedly (causes console spam + instability)
+// - Return bid/ask/last when available so frontend can do "marketable limit" logic
+// - Add a tiny cache to reduce SnapTrade spam + rate/rando failures
+//
+const quoteCache = new Map(); // key: SYMBOL, value: { ts, payload }
+const QUOTE_CACHE_MS = 900;   // ~1s cache to avoid hammering SnapTrade
+
+app.get("/api/quote/:symbol", async (req, res) => {
+  const rawSymbol = String(req.params.symbol || "").trim();
+  const symbol = rawSymbol.toUpperCase();
+
+  if (!symbol) {
+    return res.json({ ok: false, error: "Missing symbol" });
+  }
+
+  // cache hit
+  const cached = quoteCache.get(symbol);
+  const now = Date.now();
+  if (cached && now - cached.ts < QUOTE_CACHE_MS) {
+    return res.json(cached.payload);
+  }
+
+  console.log("[QuickTrade] Quote request for:", symbol);
+
+  try {
+    ensureEnv();
+
+    // Resolve to what SnapTrade expects (handles SIS -> SIS.TO etc.)
+    const symbolId = await resolveQuoteSymbolId(symbol);
+
+const quotesResp = await snaptrade.trading.getUserAccountQuotes({
+  userId: USER_ID,
+  userSecret: USER_SECRET,
+  accountId: ACCOUNT_ID,
+  symbols: symbolId, // <-- UUID, not ticker
+});
+
+
+    const data = quotesResp.data || quotesResp;
+
+    if (!Array.isArray(data) || data.length === 0) {
+      const payload = { ok: false, error: "No quote found", symbol, effectiveSymbol };
+      quoteCache.set(symbol, { ts: now, payload });
+      return res.json(payload);
+    }
+
+    const q = data[0];
+
+    // Try multiple possible field names to be robust
+    const bid =
+      q.bid_price ?? q.raw?.bid_price ?? q.bid ?? null;
+
+    const ask =
+      q.ask_price ?? q.raw?.ask_price ?? q.ask ?? null;
+
+    const last =
+      q.last_trade_price ??
+      q.last ??
+      q.price ??
+      bid ??
+      ask ??
+      null;
+
+    const currency =
+      (q.symbol && q.symbol.currency && q.symbol.currency.code) ||
+      q.currency ||
+      "CAD";
+
+    const payload = {
+      ok: true,
+      symbol,            // what frontend asked for
+      effectiveSymbol,   // what we sent to SnapTrade
+      bid,
+      ask,
+      last,
+      currency,
+      raw: q,
+    };
+
+    quoteCache.set(symbol, { ts: now, payload });
+    return res.json(payload);
+  } catch (err) {
+    const safeMessage = extractSafeError(err);
+
+    // DO NOT return HTTP 500 here — return ok:false with 200,
+    // so the extension doesn't get spammed with "500 Internal Server Error"
+    // every interval tick.
+    const payload = { ok: false, error: safeMessage, symbol };
+    quoteCache.set(symbol, { ts: now, payload });
+    return res.json(payload);
+  }
+});
+
+// ------------- ORDER ENDPOINT (panel) -------------
+app.post("/api/order", async (req, res) => {
+  const {
+    symbol,
+    side,
+    qty,
+    orderType,
+    limitPrice,
+    stopPrice,
+    fillAggression, // 0–100 from slider
+  } = req.body || {};
+
+  // ---------------- DEBUG: /api/order ----------------
+  const DEBUG_ORDERS = true;
+  function dbg(label, obj) {
+    if (!DEBUG_ORDERS) return;
+    try {
+      console.log(`[QT_DEBUG] ${label}:`, JSON.stringify(obj, null, 2));
+    } catch {
+      console.log(`[QT_DEBUG] ${label}:`, obj);
+    }
+  }
+
+  dbg("REQ_BODY", req.body);
+
+  // local helpers (kept inside this endpoint so we don't change other layout/code)
+  function clamp(n, a, b) {
+    return Math.max(a, Math.min(b, n));
+  }
+
+  // slider 0–100 -> bps (basis points)
+  function sliderToBps(v) {
+    const s = clamp(Number(v ?? 50), 0, 100);
+    if (s <= 33) return 70;   // Chill  = 0.70%
+    if (s <= 66) return 150;  // Normal = 1.50%
+    return 300;               // Savage = 3.00%
+  }
+
+  // tick rounding: pennies for >= $1, 4dp for < $1
+  function roundPx(px) {
+    const p = Number(px);
+    if (!isFinite(p)) return null;
+    if (p >= 1) return Math.round(p * 100) / 100;     // 0.01
+    return Math.round(p * 10000) / 10000;             // 0.0001
+  }
+
+  // normalize any user-entered limit to our tick rules
+  function applyBrokerTick(px) {
+    return roundPx(px);
+  }
+
+  // ✅ MARKETABLE AUTO LIMIT: BUY >= ASK+tick, SELL <= BID-tick
+  async function computeAutoLimit({ rawSymbol, side, fillAggression }) {
+    const symbolId = await resolveQuoteSymbolId(rawSymbol);
+
+    const quotesResp = await snaptrade.trading.getUserAccountQuotes({
+      userId: USER_ID,
+      userSecret: USER_SECRET,
+      accountId: ACCOUNT_ID,
+      symbols: symbolId, // UUID
+    });
+
+    const data = quotesResp.data || quotesResp;
+    const q = Array.isArray(data) && data.length > 0 ? data[0] : null;
+
+    const bid = q?.bid_price ?? q?.raw?.bid_price ?? q?.bid ?? null;
+    const ask = q?.ask_price ?? q?.raw?.ask_price ?? q?.ask ?? null;
+    const last =
+      q?.last_trade_price ??
+      q?.last ??
+      q?.price ??
+      bid ??
+      ask ??
+      null;
+
+    const isBuy = String(side).toUpperCase() === "BUY";
+
+    // reference is executable side
+    let ref = isBuy ? Number(ask) : Number(bid);
+    if (!isFinite(ref) || ref <= 0) ref = Number(last);
+
+    if (!isFinite(ref) || ref <= 0) {
+      throw new Error("QT_BACKEND_ERROR: Could not compute AUTO limit (missing bid/ask/last).");
+    }
+
+    const bps = sliderToBps(fillAggression);
+    const pct = bps / 10000;
+
+    const tick = ref >= 1 ? 0.01 : 0.0001;
+    const buffer = Math.max(ref * pct, tick);
+
+    // initial buffer
+    const rawPx = isBuy ? (ref + buffer) : (ref - buffer);
+
+    // ✅ FORCE marketability by at least 1 tick past executable side
+    const marketablePx = isBuy
+      ? Math.max(rawPx, ref + tick)
+      : Math.min(rawPx, ref - tick);
+
+    const finalPx = roundPx(marketablePx);
+
+    dbg("AUTO_LIMIT_INPUTS", {
+      rawSymbol,
+      side,
+      fillAggression,
+      bid,
+      ask,
+      last,
+      ref,
+      tick,
+      buffer,
+      rawPx,
+      marketablePx,
+      finalPx,
+    });
+
+    if (!finalPx || finalPx <= 0) {
+      throw new Error("QT_BACKEND_ERROR: AUTO limit computation failed.");
+    }
+
+    return finalPx;
+  }
+
+  try {
+    let limitToSend = limitPrice;
+    let stopToSend = stopPrice;
+
+    // ✅ If frontend sent AUTO, convert to a real numeric limit price here
+    if (String(limitToSend).toUpperCase() === "AUTO") {
+      const computed = await computeAutoLimit({
+        rawSymbol: symbol,
+        side,
+        fillAggression,
+      });
+      limitToSend = computed;
+      dbg("AUTO_LIMIT_COMPUTED", { computed: limitToSend });
+    }
+
+    // ---------------- NORMALIZE LIMIT PRICE TO BROKER TICK ----------------
+    if (
+      String(orderType).toLowerCase() === "limit" &&
+      limitToSend != null &&
+      String(limitToSend).toUpperCase() !== "AUTO"
+    ) {
+      const before = limitToSend;
+      limitToSend = applyBrokerTick(limitToSend);
+      dbg("LIMIT_TICK_NORMALIZED", { before, after: limitToSend });
+    }
+
+    dbg("ORDER_FINAL_INPUTS", {
+      symbol,
+      side,
+      qty,
+      orderType,
+      limitPrice: limitToSend,
+      stopPrice: stopToSend,
+    });
+
+    const order = await placeEquityOrder({
+      action: side,
+      symbol,
+      qty,
+      orderType,
+      limitPrice: limitToSend,
+      stopPrice: stopToSend,
+    });
+
+    dbg("SNAPTRADE_ORDER_RESPONSE", {
+      id: order?.id ?? null,
+      status: order?.status ?? null,
+      filled_quantity: order?.filled_quantity ?? null,
+      open_quantity: order?.open_quantity ?? null,
+      order_type: order?.order_type ?? null,
+      limit_price: order?.limit_price ?? null,
+      stop_price: order?.stop_price ?? null,
+      brokerage_order_id: order?.brokerage_order_id ?? null,
+      raw: order,
+    });
+
+    res.json({ ok: true, order });
+  } catch (err) {
+    const safeMessage = extractSafeError(err);
+    const body =
+      err?.responseBody ||
+      err?.body ||
+      err?.response?.data ||
+      null;
+
+    res.status(500).json({
+      ok: false,
+      error: safeMessage,
+      code: body?.code || body?.status_code || err?.code || null,
+    });
+  }
+});
+
+
+
+
+// ------------- LEGACY /api/trade -------------
+app.post("/api/trade", async (req, res) => {
+  const { action, symbol, shares, orderType, price } = req.body || {};
+
+  console.log("[QuickTrade] Incoming /api/trade payload:", req.body);
+
+  try 
+  
+  {
+    const order = await placeEquityOrder({
+      action,
+      symbol,
+      qty: shares,
+      orderType,
+      limitPrice: price,
+      stopPrice: null,
+    });
+
+    res.json({ ok: true, order });
+  } catch (err) {
+    const safeMessage = extractSafeError(err);
+    const body =
+      err?.responseBody ||
+      err?.body ||
+      err?.response?.data ||
+      null;
+
+    res.status(500).json({
+      ok: false,
+      error: safeMessage,
+      code: body?.code || body?.status_code || err?.code || null,
+    });
+  }
+});
+
+// ------------- DEBUG TEST ORDER -------------
+
+app.get("/api/debug/test-order", async (req, res) => {
+  try {
+    const testSymbol = "AAPL"; // adjust while testing
+    console.log("[QuickTrade DEBUG] Testing order for:", testSymbol);
+
+    const result = await placeEquityOrder({
+      action: "BUY",
+      symbol: testSymbol,
+      qty: 1,
+      orderType: "market",
+      limitPrice: null,
+      stopPrice: null,
+    });
+
+    res.json({ ok: true, result });
+  } catch (err) {
+    const safeMessage = extractSafeError(err);
+    res.status(500).json({ ok: false, error: safeMessage });
+  }
+});
+
+// -------- START ALPACA MARKET DATA STREAM (v2/iex) --------
+// This runs independently of SnapTrade and is used ONLY for signals/VWAP.
+try {
+  startAlpacaWS((msgs) => {
+    for (const m of msgs) {
+      if (m?.T === "q") onQuote(m);  // quote
+      if (m?.T === "t") onTrade(m);  // trade
+      if (m?.T === "b") onBar(m);    // minute bar
+    }
+  });
+
+  // Default watchlist for startup (can be changed via POST /api/watchlist)
+  setWatchlist(["AAPL", "TSLA"]);
+  alpacaSubscribe(["AAPL", "TSLA"]);
+} catch (alpacaErr) {
+  console.warn("[QuickTrade] Alpaca stream failed to start (non-fatal):", alpacaErr.message);
+}
+
+
+
+// ------------- START SERVER -------------
+
+const PORT = 8000;
+app.listen(PORT, () => {
+  console.log(
+    `✅ QuickTrade REAL MONEY backend running on http://localhost:${PORT}`
+  );
+});
