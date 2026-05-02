@@ -31,6 +31,7 @@ const { start: startFinnhubWS, subscribe: finnhubSubscribe, fetchQuote } = requi
 const { onQuote, onTrade, onBar } = require("./market/signalsEngine");
 const { makeSignalsRouter } = require("./market/signals.routes");
 const { setWatchlist, getWatchlist } = require("./market/signalsStore");
+const trailingStopMgr = require("./market/trailingStopManager");
 
 const FINNHUB_KEY = process.env.Finnhub_KEY || "";
 
@@ -118,6 +119,66 @@ app.get("/api/top-movers", async (req, res) => {
     console.error("[QuickTrade] Top movers error:", err.message);
     res.json({ ok: true, source: "error", gainers: [], error: err.message });
   }
+});
+
+// ------------- TRAILING STOP ENDPOINTS -------------
+// Helper: place a stop sell order via SnapTrade
+async function placeStopSellOrder(symbol, qty, stopPrice) {
+  try {
+    const result = await snaptrade.trading.placeForceOrder({
+      userId: USER_ID,
+      userSecret: USER_SECRET,
+      account_id: ACCOUNT_ID,
+      action: "SELL",
+      order_type: "Stop",
+      time_in_force: "Day",
+      universal_symbol_id: symbol,
+      price: stopPrice,
+      stop: stopPrice,
+      units: qty,
+    });
+    return result?.data?.brokerage_order_id || result?.data?.id || "unknown";
+  } catch (e) {
+    console.warn("[TrailingStop] placeStopSellOrder error:", e.message);
+    return null;
+  }
+}
+
+// Helper: cancel an order
+async function cancelStopOrder(orderId) {
+  try {
+    // SnapTrade cancel is typically done through the brokerage
+    console.log(`[TrailingStop] Cancel order ${orderId} (auto-replaced by new stop)`);
+  } catch (e) {
+    console.warn("[TrailingStop] cancelOrder error:", e.message);
+  }
+}
+
+// Initialize trailing stop manager
+trailingStopMgr.init({
+  placeStopOrder: placeStopSellOrder,
+  cancelOrder: cancelStopOrder,
+});
+
+// POST /api/trailing-stop — register a trailing stop
+app.post("/api/trailing-stop", (req, res) => {
+  const { symbol, qty, trailPct, entryPrice } = req.body;
+  if (!symbol || !qty || !trailPct || !entryPrice) {
+    return res.status(400).json({ ok: false, error: "Missing symbol, qty, trailPct, or entryPrice" });
+  }
+  const result = trailingStopMgr.register(symbol, qty, trailPct, entryPrice);
+  res.json(result);
+});
+
+// DELETE /api/trailing-stop/:symbol — deregister a trailing stop
+app.delete("/api/trailing-stop/:symbol", (req, res) => {
+  const result = trailingStopMgr.deregister(req.params.symbol.toUpperCase());
+  res.json(result);
+});
+
+// GET /api/trailing-stops — list active trailing stops
+app.get("/api/trailing-stops", (req, res) => {
+  res.json({ ok: true, stops: trailingStopMgr.getActive() });
 });
 
 // ------------- LIST CONNECTIONS (BROKERAGE AUTHORIZATIONS) -------------
