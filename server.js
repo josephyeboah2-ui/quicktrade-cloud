@@ -26,11 +26,13 @@ const bodyParser = require("body-parser");
 const cors = require("cors");
 const { Snaptrade } = require("snaptrade-typescript-sdk");
 
-// -------- Alpaca Market Data (signals only) --------
-const { start: startAlpacaWS, subscribe: alpacaSubscribe } = require("./market/alpacaStream");
+// -------- Finnhub Market Data (signals + quotes) --------
+const { start: startFinnhubWS, subscribe: finnhubSubscribe, fetchQuote } = require("./market/finnhubStream");
 const { onQuote, onTrade, onBar } = require("./market/signalsEngine");
 const { makeSignalsRouter } = require("./market/signals.routes");
-const { setWatchlist } = require("./market/signalsStore");
+const { setWatchlist, getWatchlist } = require("./market/signalsStore");
+
+const FINNHUB_KEY = process.env.Finnhub_KEY || "";
 
 
 // ---------------- ENV ----------------
@@ -75,7 +77,7 @@ app.use(bodyParser.json());
 // -------- Signals API (read-only, no trading) --------
 app.use(
   makeSignalsRouter({
-    onWatchlistChanged: (symbols) => alpacaSubscribe(symbols),
+    onWatchlistChanged: (symbols) => finnhubSubscribe(symbols),
   })
 );
 
@@ -84,57 +86,34 @@ app.get("/", (req, res) => {
   res.json({ ok: true, message: "QuickTrade SnapTrade backend alive" });
 });
 
-// ------------- TOP MOVERS (Gainers 3%+) -------------
-const ALPACA_KEY = process.env.ALPACA_API_KEY || "";
-const ALPACA_SECRET = process.env.ALPACA_API_SECRET || "";
-const hasAlpacaKeys = ALPACA_KEY && ALPACA_KEY !== "your_key_here";
+// ------------- TOP MOVERS (Gainers 3%+) via Finnhub -------------
+const POPULAR_SYMBOLS = ["AAPL","TSLA","NVDA","AMZN","META","GOOGL","MSFT","AMD","PLTR","SOFI","RIVN","NIO","COIN","SNAP","UBER","SQ","SHOP","BABA","INTC","PYPL"];
 
 app.get("/api/top-movers", async (req, res) => {
   try {
-    const minGain = parseFloat(req.query.min || "3"); // default 3%
-    const limit = parseInt(req.query.limit || "5");    // default top 5
+    const minGain = parseFloat(req.query.min || "3");
+    const limit = parseInt(req.query.limit || "5");
 
-    if (hasAlpacaKeys) {
-      // Use Alpaca screener API
-      const fetch = (await import("node-fetch")).default;
-      const url = "https://data.alpaca.markets/v1beta1/screener/stocks/movers?top=20";
-      const resp = await fetch(url, {
-        headers: {
-          "APCA-API-KEY-ID": ALPACA_KEY,
-          "APCA-API-SECRET-KEY": ALPACA_SECRET,
-        },
-      });
-      const data = await resp.json();
-      const gainers = (data.gainers || [])
-        .filter(g => g.percent_change >= minGain)
-        .slice(0, limit)
-        .map(g => ({
-          symbol: g.symbol,
-          price: g.price,
-          change: g.change,
-          changePct: g.percent_change,
-          volume: g.volume || null,
-        }));
-
-      return res.json({ ok: true, source: "alpaca", gainers });
+    if (!FINNHUB_KEY) {
+      return res.json({ ok: true, source: "no_key", gainers: [] });
     }
 
-    // Fallback: use internal signal store data
-    const allSignals = require("./market/signalsStore").getAll();
-    const gainers = allSignals
-      .filter(s => s.last && s.vwap && s.last > s.vwap)
-      .map(s => ({
-        symbol: s.symbol,
-        price: s.last,
-        changePct: s.vwap > 0 ? ((s.last - s.vwap) / s.vwap * 100) : 0,
-        signal: s.signal,
-        confidence: s.confidence,
-      }))
+    const fetch = (await import("node-fetch")).default;
+    const promises = POPULAR_SYMBOLS.map(async (sym) => {
+      try {
+        const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FINNHUB_KEY}`);
+        const d = await r.json();
+        return { symbol: sym, price: d.c, changePct: d.dp || 0 };
+      } catch { return null; }
+    });
+
+    const results = (await Promise.all(promises)).filter(Boolean);
+    const gainers = results
       .filter(g => g.changePct >= minGain)
       .sort((a, b) => b.changePct - a.changePct)
       .slice(0, limit);
 
-    res.json({ ok: true, source: "internal", gainers });
+    res.json({ ok: true, source: "finnhub", gainers });
   } catch (err) {
     console.error("[QuickTrade] Top movers error:", err.message);
     res.json({ ok: true, source: "error", gainers: [], error: err.message });
@@ -1264,22 +1243,36 @@ app.get("/api/debug/test-order", async (req, res) => {
   }
 });
 
-// -------- START ALPACA MARKET DATA STREAM (v2/iex) --------
-// This runs independently of SnapTrade and is used ONLY for signals/VWAP.
+// -------- START FINNHUB MARKET DATA STREAM --------
 try {
-  startAlpacaWS((msgs) => {
-    for (const m of msgs) {
-      if (m?.T === "q") onQuote(m);  // quote
-      if (m?.T === "t") onTrade(m);  // trade
-      if (m?.T === "b") onBar(m);    // minute bar
-    }
-  });
+  if (FINNHUB_KEY) {
+    startFinnhubWS(FINNHUB_KEY, (msgs) => {
+      for (const m of msgs) {
+        if (m?.T === "q") onQuote(m);
+        if (m?.T === "t") onTrade(m);
+        if (m?.T === "b") onBar(m);
+      }
+    });
 
-  // Default watchlist for startup (can be changed via POST /api/watchlist)
-  setWatchlist(["AAPL", "TSLA"]);
-  alpacaSubscribe(["AAPL", "TSLA"]);
-} catch (alpacaErr) {
-  console.warn("[QuickTrade] Alpaca stream failed to start (non-fatal):", alpacaErr.message);
+    // Default watchlist
+    setWatchlist(["AAPL", "TSLA"]);
+    finnhubSubscribe(["AAPL", "TSLA"]);
+
+    // REST polling for quote data every 5 seconds (bid/ask, VWAP-like)
+    setInterval(async () => {
+      const wl = getWatchlist();
+      for (const sym of wl) {
+        const q = await fetchQuote(sym);
+        if (q) onQuote(q);
+      }
+    }, 5000);
+
+    console.log("[QuickTrade] Finnhub stream started.");
+  } else {
+    console.warn("[QuickTrade] No Finnhub key — signals disabled.");
+  }
+} catch (err) {
+  console.warn("[QuickTrade] Finnhub stream failed (non-fatal):", err.message);
 }
 
 
