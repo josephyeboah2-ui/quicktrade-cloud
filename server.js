@@ -87,34 +87,62 @@ app.get("/", (req, res) => {
   res.json({ ok: true, message: "QuickTrade SnapTrade backend alive" });
 });
 
-// ------------- TOP MOVERS (Gainers 3%+) via Finnhub -------------
-const POPULAR_SYMBOLS = ["AAPL","TSLA","NVDA","AMZN","META","GOOGL","MSFT","AMD","PLTR","SOFI","RIVN","NIO","COIN","SNAP","UBER","SQ","SHOP","BABA","INTC","PYPL"];
-
+// ------------- TOP MOVERS (Gainers — ALL US stocks) -------------
 app.get("/api/top-movers", async (req, res) => {
   try {
     const minGain = parseFloat(req.query.min || "3");
     const limit = parseInt(req.query.limit || "5");
 
-    if (!FINNHUB_KEY) {
-      return res.json({ ok: true, source: "no_key", gainers: [] });
+    const fetch = (await import("node-fetch")).default;
+
+    // Primary: Yahoo Finance screener (covers ALL US stocks)
+    try {
+      const yUrl = `https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=25`;
+      const yResp = await fetch(yUrl, {
+        headers: { "User-Agent": "Mozilla/5.0" },
+        timeout: 8000,
+      });
+      const yData = await yResp.json();
+      const quotes = yData?.finance?.result?.[0]?.quotes || [];
+
+      if (quotes.length > 0) {
+        const gainers = quotes
+          .map(q => ({
+            symbol: q.symbol,
+            price: q.regularMarketPrice || 0,
+            changePct: q.regularMarketChangePercent || 0,
+            volume: q.regularMarketVolume || 0,
+            name: q.shortName || q.symbol,
+          }))
+          .filter(g => g.changePct >= minGain && g.price > 0)
+          .sort((a, b) => b.changePct - a.changePct)
+          .slice(0, limit);
+
+        return res.json({ ok: true, source: "yahoo", gainers });
+      }
+    } catch (yErr) {
+      console.warn("[QuickTrade] Yahoo screener failed, trying Finnhub:", yErr.message);
     }
 
-    const fetch = (await import("node-fetch")).default;
-    const promises = POPULAR_SYMBOLS.map(async (sym) => {
-      try {
-        const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FINNHUB_KEY}`);
-        const d = await r.json();
-        return { symbol: sym, price: d.c, changePct: d.dp || 0 };
-      } catch { return null; }
-    });
+    // Fallback: Finnhub scan of popular symbols
+    if (FINNHUB_KEY) {
+      const FALLBACK = ["AAPL","TSLA","NVDA","AMZN","META","GOOGL","MSFT","AMD","PLTR","SOFI","COIN","MARA","RIOT","HOOD","GME","AMC","NIO","SNAP","SMCI","MSTR","MRNA","DKNG","LCID","ARM","NFLX"];
+      const promises = FALLBACK.map(async (sym) => {
+        try {
+          const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FINNHUB_KEY}`);
+          const d = await r.json();
+          return { symbol: sym, price: d.c, changePct: d.dp || 0 };
+        } catch { return null; }
+      });
+      const results = (await Promise.all(promises)).filter(Boolean);
+      const gainers = results
+        .filter(g => g.changePct >= minGain)
+        .sort((a, b) => b.changePct - a.changePct)
+        .slice(0, limit);
+      return res.json({ ok: true, source: "finnhub", gainers });
+    }
 
-    const results = (await Promise.all(promises)).filter(Boolean);
-    const gainers = results
-      .filter(g => g.changePct >= minGain)
-      .sort((a, b) => b.changePct - a.changePct)
-      .slice(0, limit);
-
-    res.json({ ok: true, source: "finnhub", gainers });
+    res.json({ ok: true, source: "none", gainers: [] });
   } catch (err) {
     console.error("[QuickTrade] Top movers error:", err.message);
     res.json({ ok: true, source: "error", gainers: [], error: err.message });
