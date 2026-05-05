@@ -8,6 +8,7 @@ let apiKey = "";
 let subscribedSymbols = [];
 let onMsgCallback = null;
 let reconnectTimer = null;
+let reconnectDelay = 3000; // start at 3s, backs off on 429
 
 function start(key, onMessages) {
   apiKey = key;
@@ -22,6 +23,7 @@ function connect() {
 
   ws.on("open", () => {
     console.log("[Finnhub WS] Connected");
+    reconnectDelay = 3000; // reset backoff on success
     // Re-subscribe all symbols
     subscribedSymbols.forEach(s => {
       ws.send(JSON.stringify({ type: "subscribe", symbol: s }));
@@ -32,12 +34,11 @@ function connect() {
     try {
       const msg = JSON.parse(raw.toString());
       if (msg.type === "trade" && Array.isArray(msg.data)) {
-        // Finnhub sends: { type: "trade", data: [{ s: symbol, p: price, v: volume, t: timestamp }] }
         const converted = msg.data.map(d => ({
-          T: "t",          // trade
-          S: d.s,          // symbol
-          p: d.p,          // price
-          s: d.v,          // size/volume
+          T: "t",
+          S: d.s,
+          p: d.p,
+          s: d.v,
           t: new Date(d.t).toISOString(),
         }));
         if (onMsgCallback) onMsgCallback(converted);
@@ -48,12 +49,17 @@ function connect() {
   });
 
   ws.on("close", () => {
-    console.log("[Finnhub WS] Disconnected, reconnecting in 3s...");
-    reconnectTimer = setTimeout(connect, 3000);
+    console.log(`[Finnhub WS] Disconnected, reconnecting in ${reconnectDelay / 1000}s...`);
+    reconnectTimer = setTimeout(connect, reconnectDelay);
   });
 
   ws.on("error", (err) => {
-    console.warn("[Finnhub WS] Error:", err.message);
+    if (err.message && err.message.includes("429")) {
+      reconnectDelay = Math.min(reconnectDelay * 2, 120000); // backoff up to 2 min
+      console.warn(`[Finnhub WS] Rate limited (429), backing off to ${reconnectDelay / 1000}s`);
+    } else {
+      console.warn("[Finnhub WS] Error:", err.message);
+    }
   });
 }
 
