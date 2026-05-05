@@ -580,8 +580,15 @@ async function placeEquityOrder({
   const sp =
     stopPrice !== undefined && stopPrice !== null ? Number(stopPrice) : null;
 
-  if (!isMarket && (px === null || isNaN(px) || px <= 0)) {
-    throw new Error("Limit/Stop/StopLimit order requires a valid price.");
+  if (snapOrderType === "Limit" && (px === null || isNaN(px) || px <= 0)) {
+    throw new Error("Limit order requires a valid limit price.");
+  }
+  if (snapOrderType === "Stop" && (sp === null || isNaN(sp) || sp <= 0)) {
+    throw new Error("Stop order requires a valid stop price.");
+  }
+  if (snapOrderType === "StopLimit") {
+    if (px === null || isNaN(px) || px <= 0) throw new Error("StopLimit requires a valid limit price.");
+    if (sp === null || isNaN(sp) || sp <= 0) throw new Error("StopLimit requires a valid stop price.");
   }
 
   // Resolve symbol to what SnapTrade actually expects (e.g. SIS → SIS.TO)
