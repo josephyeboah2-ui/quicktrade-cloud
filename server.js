@@ -1229,6 +1229,44 @@ app.post("/api/order", async (req, res) => {
       dbg("AUTO_LIMIT_COMPUTED", { computed: limitToSend });
     }
 
+    // ✅ For limit BUY: ensure price >= real ask so it fills immediately
+    // For limit SELL: ensure price <= real bid
+    if (
+      String(orderType).toLowerCase() === "limit" &&
+      limitToSend != null &&
+      String(limitToSend).toUpperCase() !== "AUTO"
+    ) {
+      try {
+        const symbolId = await resolveQuoteSymbolId(symbol);
+        const quotesResp = await snaptrade.trading.getUserAccountQuotes({
+          userId: USER_ID,
+          userSecret: USER_SECRET,
+          accountId: ACCOUNT_ID,
+          symbols: symbolId,
+        });
+        const qData = quotesResp.data || quotesResp;
+        const q = Array.isArray(qData) && qData.length > 0 ? qData[0] : null;
+        const realAsk = q?.ask_price ?? q?.raw?.ask_price ?? null;
+        const realBid = q?.bid_price ?? q?.raw?.bid_price ?? null;
+
+        if (side.toUpperCase() === "BUY" && realAsk && realAsk > 0) {
+          const askPlus = +(realAsk * 1.002).toFixed(2); // ask + 0.2% cushion
+          if (Number(limitToSend) < askPlus) {
+            dbg("LIMIT_BUMPED_TO_ASK", { was: limitToSend, realAsk, newLimit: askPlus });
+            limitToSend = askPlus;
+          }
+        } else if (side.toUpperCase() === "SELL" && realBid && realBid > 0) {
+          const bidMinus = +(realBid * 0.998).toFixed(2);
+          if (Number(limitToSend) > bidMinus) {
+            dbg("LIMIT_LOWERED_TO_BID", { was: limitToSend, realBid, newLimit: bidMinus });
+            limitToSend = bidMinus;
+          }
+        }
+      } catch (qErr) {
+        dbg("QUOTE_FETCH_SKIP", { error: qErr.message });
+      }
+    }
+
     // ---------------- NORMALIZE LIMIT PRICE TO BROKER TICK ----------------
     if (
       String(orderType).toLowerCase() === "limit" &&
