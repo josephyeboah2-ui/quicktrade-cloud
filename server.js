@@ -95,18 +95,34 @@ app.get("/api/top-movers", async (req, res) => {
 
     const fetch = (await import("node-fetch")).default;
 
-    // Primary: Yahoo Finance screener (covers ALL US stocks)
+    // Primary: Yahoo Finance screener (large-cap + small-cap gainers)
     try {
-      const yUrl = `https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=25`;
-      const yResp = await fetch(yUrl, {
-        headers: { "User-Agent": "Mozilla/5.0" },
-        timeout: 8000,
-      });
-      const yData = await yResp.json();
-      const quotes = yData?.finance?.result?.[0]?.quotes || [];
+      const screeners = ["day_gainers", "small_cap_gainers"];
+      const allQuotes = [];
 
-      if (quotes.length > 0) {
-        const gainers = quotes
+      for (const scrId of screeners) {
+        try {
+          const yUrl = `https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=${scrId}&count=25`;
+          const yResp = await fetch(yUrl, {
+            headers: { "User-Agent": "Mozilla/5.0" },
+            timeout: 8000,
+          });
+          const yData = await yResp.json();
+          const quotes = yData?.finance?.result?.[0]?.quotes || [];
+          allQuotes.push(...quotes);
+        } catch {}
+      }
+
+      // Deduplicate by symbol
+      const seen = new Set();
+      const unique = allQuotes.filter(q => {
+        if (seen.has(q.symbol)) return false;
+        seen.add(q.symbol);
+        return true;
+      });
+
+      if (unique.length > 0) {
+        const gainers = unique
           .map(q => ({
             symbol: q.symbol,
             price: q.regularMarketPrice || 0,
