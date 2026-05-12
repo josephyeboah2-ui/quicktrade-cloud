@@ -1,4 +1,4 @@
-// server.js
+﻿// server.js
 // QuickTrade REAL MONEY backend using SnapTrade
 // - Serves:
 //     GET  /                               -> health check
@@ -11,7 +11,7 @@
 //     GET  /api/snaptrade/accounts         -> list linked user accounts (not implemented here)
 //     GET  /api/market-clock               -> exchange session + recommended order type
 
-require("dotenv").config();
+require("dotenv").config({ path: require("path").join(__dirname, ".env") });
 
 // --- GLOBAL ERROR HANDLERS (must be first!) ---
 process.on("unhandledRejection", (reason) => {
@@ -81,6 +81,169 @@ app.use(
     onWatchlistChanged: (symbols) => finnhubSubscribe(symbols),
   })
 );
+
+// -------- Python Bot Spawner --------
+const { spawn, exec } = require("child_process");
+const path = require("path");
+const fs = require("fs");
+
+const activeBots = {};
+
+function spawnPythonBot(scriptName, reqBody) {
+  if (activeBots[scriptName]) {
+    console.log(`[QuickTrade] Killing active ${scriptName}...`);
+    activeBots[scriptName].kill();
+  }
+  const { tickers, maxSize, maxLoss, takeProfitPct, trailingStopPct, broker, accountId, strategy } = reqBody;
+  
+  const scriptPath = path.resolve(__dirname, `../QuickTradeExtension/backend/${scriptName}`);
+  const args = [scriptPath];
+  
+  if (tickers) args.push("--tickers", tickers);
+  if (maxSize) args.push("--max_size", maxSize.toString());
+  if (maxLoss) args.push("--max_loss", maxLoss.toString());
+  if (takeProfitPct) args.push("--take_profit_pct", takeProfitPct.toString());
+  if (trailingStopPct) args.push("--trailing_stop_pct", trailingStopPct.toString());
+  if (broker) args.push("--broker", broker);
+  if (accountId) args.push("--account_id", accountId);
+  if (strategy) args.push("--strategy", strategy);
+
+  console.log(`\n[QuickTrade] Spawning Python Bot: ${scriptName}`);
+  const pyProcess = spawn("python", args, {
+    env: { ...process.env, PYTHONIOENCODING: "utf-8" }
+  });
+
+  activeBots[scriptName] = pyProcess;
+
+  pyProcess.stdout.on("data", (data) => {
+    process.stdout.write(data.toString());
+  });
+
+  pyProcess.stderr.on("data", (data) => {
+    process.stderr.write(data.toString());
+  });
+
+  pyProcess.on("close", (code) => {
+    console.log(`[QuickTrade] Python Bot (${scriptName}) exited with code ${code}`);
+    delete activeBots[scriptName];
+  });
+}
+
+function stopPythonBot(scriptName) {
+  if (activeBots[scriptName]) {
+    console.log(`[QuickTrade] Stopping Python Bot: ${scriptName}`);
+    activeBots[scriptName].kill();
+    delete activeBots[scriptName];
+  }
+}
+
+app.get("/api/bots/status", (req, res) => {
+  res.json({
+    live: !!activeBots["live_trader.py"],
+    paper: !!activeBots["paper_trader.py"]
+  });
+});
+
+
+app.get("/api/history", (req, res) => {
+    const { exec } = require("child_process");
+    exec("python fetch_history.py", { cwd: __dirname }, (error, stdout, stderr) => {
+        if (error) {
+            console.error("Error fetching history:", error);
+            return res.json([]);
+        }
+        try {
+            const data = JSON.parse(stdout);
+            res.json(data);
+        } catch (e) {
+            console.error("Error parsing history JSON:", e);
+            res.json([]);
+        }
+    });
+});
+
+app.post("/api/live/start", (req, res) => {
+  spawnPythonBot("live_trader.py", req.body);
+  res.json({ ok: true, message: "Live bot started" });
+});
+
+app.post("/api/live/stop", (req, res) => {
+  stopPythonBot("live_trader.py");
+  res.json({ ok: true, message: "Live bot stopped" });
+});
+
+app.post("/api/paper/start", (req, res) => {
+  spawnPythonBot("paper_trader.py", req.body);
+  res.json({ ok: true, message: "Paper bot started" });
+});
+
+app.post("/api/paper/stop", (req, res) => {
+  stopPythonBot("paper_trader.py");
+  res.json({ ok: true, message: "Paper bot stopped" });
+});
+app.post("/api/backtest", (req, res) => {
+  const { tickers, days, balance, riskPct, dailyQuota, strategy } = req.body;
+  const scriptName = "backtester.py";
+  const scriptPath = path.join(__dirname, "../QuickTradeExtension/backend", scriptName);
+
+  let args = [];
+  if (tickers) args.push("--tickers", `"${tickers}"`);
+  if (days) args.push("--days", days);
+  if (balance) args.push("--balance", balance);
+  if (riskPct) args.push("--risk_pct", riskPct);
+  if (strategy) args.push("--strategy", strategy);
+  if (dailyQuota) args.push("--daily_quota", dailyQuota);
+
+  const command = `python "${scriptPath}" ${args.join(" ")}`;
+  console.log(`[QuickTrade] Running Backtest: ${command}`);
+
+  exec(command, { maxBuffer: 1024 * 1024 * 10, env: { ...process.env, PYTHONIOENCODING: "utf-8" } }, (error, stdout, stderr) => {
+    if (error) {
+      console.error(`[QuickTrade] Backtest Error: ${error}`);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+    
+    try {
+      // Find the JSON block in stdout
+      const match = stdout.match(/===BACKTEST_RESULT===\r?\n([\s\S]+?)\r?\n===END_RESULT===/);
+      if (match && match[1]) {
+        const result = JSON.parse(match[1]);
+        res.json({ ok: true, data: result });
+      } else {
+        res.status(500).json({ ok: false, error: "Invalid backtest output" });
+      }
+    } catch (err) {
+      res.status(500).json({ ok: false, error: "Failed to parse backtest results" });
+    }
+  });
+});
+
+
+app.get("/api/history/:ticker", (req, res) => {
+  const ticker = req.params.ticker;
+  const period = req.query.period || "1mo";
+  const scriptName = "fetch_history.py";
+  const scriptPath = path.join(__dirname, "../QuickTradeExtension/backend", scriptName);
+
+  const command = `python "${scriptPath}" --ticker ${ticker} --period ${period}`;
+  
+  exec(command, { maxBuffer: 1024 * 1024 * 2 }, (error, stdout, stderr) => {
+    if (error) {
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+    try {
+      const match = stdout.match(/===CHART_DATA===\r?\n([\s\S]+?)\r?\n===END_CHART_DATA===/);
+      if (match && match[1]) {
+        const result = JSON.parse(match[1]);
+        res.json({ ok: true, data: result });
+      } else {
+        res.status(500).json({ ok: false, error: "Invalid chart output" });
+      }
+    } catch (err) {
+      res.status(500).json({ ok: false, error: "Failed to parse chart data" });
+    }
+  });
+});
 
 // health check
 app.get("/", (req, res) => {
@@ -166,51 +329,18 @@ app.get("/api/top-movers", async (req, res) => {
 });
 
 // ------------- TRAILING STOP ENDPOINTS -------------
-// Helper: place a stop sell order via SnapTrade
-async function placeStopSellOrder(symbol, qty, stopPrice) {
-  try {
-    const result = await snaptrade.trading.placeForceOrder({
-      userId: USER_ID,
-      userSecret: USER_SECRET,
-      account_id: ACCOUNT_ID,
-      action: "SELL",
-      order_type: "Stop",
-      time_in_force: "Day",
-      universal_symbol_id: symbol,
-      price: stopPrice,
-      stop: stopPrice,
-      units: qty,
-    });
-    return result?.data?.brokerage_order_id || result?.data?.id || "unknown";
-  } catch (e) {
-    console.warn("[TrailingStop] placeStopSellOrder error:", e.message);
-    return null;
-  }
-}
-
-// Helper: cancel an order
-async function cancelStopOrder(orderId) {
-  try {
-    // SnapTrade cancel is typically done through the brokerage
-    console.log(`[TrailingStop] Cancel order ${orderId} (auto-replaced by new stop)`);
-  } catch (e) {
-    console.warn("[TrailingStop] cancelOrder error:", e.message);
-  }
-}
-
 // Initialize trailing stop manager
 trailingStopMgr.init({
-  placeStopOrder: placeStopSellOrder,
-  cancelOrder: cancelStopOrder,
+  placeEquityOrder: placeEquityOrder,
 });
 
 // POST /api/trailing-stop — register a trailing stop
 app.post("/api/trailing-stop", (req, res) => {
-  const { symbol, qty, trailPct, entryPrice } = req.body;
+  const { symbol, qty, trailPct, entryPrice, accountId } = req.body;
   if (!symbol || !qty || !trailPct || !entryPrice) {
     return res.status(400).json({ ok: false, error: "Missing symbol, qty, trailPct, or entryPrice" });
   }
-  const result = trailingStopMgr.register(symbol, qty, trailPct, entryPrice);
+  const result = trailingStopMgr.register(symbol, qty, trailPct, entryPrice, accountId);
   res.json(result);
 });
 
@@ -274,6 +404,42 @@ app.get("/api/snaptrade/accounts", async (req, res) => {
       anyDisabled,
       anyMaintenance,
       connections,
+    });
+  } catch (err) {
+    const safeMessage = extractSafeError(err);
+    return res.status(500).json({ ok: false, error: safeMessage });
+  }
+});
+
+// ------------- LIST USER ACCOUNTS (Trading Accounts) -------------
+app.get("/api/snaptrade/user-accounts", async (req, res) => {
+  console.log("[QuickTrade] /api/snaptrade/user-accounts");
+
+  try {
+    if (!CLIENT_ID || !CONSUMER_KEY || !USER_ID || !USER_SECRET) {
+      return res.status(500).json({
+        ok: false,
+        error: "Missing SNAPTRADE_CLIENT_ID / CONSUMER_KEY / USER_ID / USER_SECRET",
+      });
+    }
+
+    const resp = await snaptrade.accountInformation.listUserAccounts({
+      userId: USER_ID,
+      userSecret: USER_SECRET,
+    });
+
+    const list = resp.data || resp || [];
+
+    const accounts = (Array.isArray(list) ? list : []).map((a) => ({
+      id: a.id,
+      name: a.name,
+      number: a.number,
+      sync_status: a.sync_status?.status,
+    }));
+
+    return res.json({
+      ok: true,
+      accounts,
     });
   } catch (err) {
     const safeMessage = extractSafeError(err);
@@ -450,8 +616,11 @@ async function resolveQuoteSymbolId(rawSymbol) {
     return quoteSymbolCache.get(upper);
   }
 
+  // Strip .US or .TO for the SnapTrade lookup, as getSymbols doesn't recognize them
+  const searchBase = upper.split('.')[0];
+
   const resp = await snaptrade.referenceData.getSymbols({
-    substring: upper,
+    substring: searchBase,
   });
 
   const list = resp.data || [];
@@ -460,10 +629,27 @@ async function resolveQuoteSymbolId(rawSymbol) {
     throw new Error(`No SnapTrade symbol found for ${upper}`);
   }
 
-  // Prefer exact raw_symbol match
-  const best =
-    list.find((s) => String(s.raw_symbol || "").toUpperCase() === upper) ||
-    list[0];
+  // Prefer exact raw_symbol match on North American exchanges
+  const validExchanges = ["NASDAQ", "NYSE", "AMEX", "BATS", "TSX", "TSXV", "CSE"];
+  let best = list.find((s) => {
+    if (!s || !s.raw_symbol) return false;
+    const isMatch = String(s.raw_symbol).toUpperCase() === searchBase;
+    const exchangeCode = s.exchange && s.exchange.code ? String(s.exchange.code).toUpperCase() : "";
+    
+    // If user explicitly typed .US or .TO, strictly enforce the exchange location
+    if (upper.endsWith(".US")) {
+      return isMatch && ["NASDAQ", "NYSE", "AMEX", "BATS"].includes(exchangeCode);
+    } else if (upper.endsWith(".TO") || upper.endsWith(".V")) {
+      return isMatch && ["TSX", "TSXV", "CSE"].includes(exchangeCode);
+    }
+
+    return isMatch && validExchanges.includes(exchangeCode);
+  });
+
+  if (!best) {
+    best = list.find((s) => String(s.raw_symbol || "").toUpperCase() === searchBase);
+  }
+  if (!best) best = list[0];
 
   if (!best || !best.id) {
     throw new Error(`Symbol ID missing for ${upper}`);
@@ -497,10 +683,22 @@ async function resolveEffectiveSymbol(rawSymbol) {
     const list = resp.data || resp || [];
 
     if (Array.isArray(list) && list.length > 0) {
+      // Prioritize North American exchanges since user trades stocks on Wealthsimple
+      const validExchanges = ["NASDAQ", "NYSE", "AMEX", "BATS", "TSX", "TSXV", "CSE"];
       let best = list.find((s) => {
         if (!s || !s.raw_symbol) return false;
-        return String(s.raw_symbol).toUpperCase() === upper;
+        const isMatch = String(s.raw_symbol).toUpperCase() === upper;
+        const exchangeCode = s.exchange && s.exchange.code ? String(s.exchange.code).toUpperCase() : "";
+        return isMatch && validExchanges.includes(exchangeCode);
       });
+
+      // Fallback if no NA exchange match
+      if (!best) {
+        best = list.find((s) => {
+          if (!s || !s.raw_symbol) return false;
+          return String(s.raw_symbol).toUpperCase() === upper;
+        });
+      }
 
       if (!best) best = list[0];
 
@@ -544,6 +742,7 @@ async function placeEquityOrder({
   orderType, // "market" | "limit" | "stop" | "stop_limit"
   limitPrice,
   stopPrice,
+  accountId,
 }) {
   ensureEnv();
 
@@ -591,20 +790,22 @@ async function placeEquityOrder({
     if (sp === null || isNaN(sp) || sp <= 0) throw new Error("StopLimit requires a valid stop price.");
   }
 
-  // Resolve symbol to what SnapTrade actually expects (e.g. SIS → SIS.TO)
-  const effectiveSymbol = await resolveEffectiveSymbol(symbol);
+  // Resolve symbol to UUID (automatically filtered for North American exchanges)
+  const symbolId = await resolveQuoteSymbolId(symbol);
 
   // Simple mapping for trading_session:
   //  - REGULAR -> "REGULAR"
   //  - PRE/POST -> still "REGULAR" for now (SnapTrade will route if supported)
   const tradingSession = clock.isOpenRegular ? "REGULAR" : "REGULAR";
 
+  const finalAccountId = accountId || ACCOUNT_ID;
+
   const payload = {
     userId: USER_ID,
     userSecret: USER_SECRET,
-    account_id: ACCOUNT_ID,
+    account_id: finalAccountId,
     action: snapAction,
-    symbol: effectiveSymbol,
+    universal_symbol_id: symbolId,
     order_type: snapOrderType,
     time_in_force: "Day",
     trading_session: tradingSession,
@@ -680,6 +881,23 @@ app.post("/api/snaptrade/reset-user-secret", async (req, res) => {
 });
 
 // ------------- SNAPTRADE PORTAL (no broker hard-coded) -------------
+
+app.get("/api/snaptrade/connect-webull", async (req, res) => {
+  try {
+    if (!CLIENT_ID || !CONSUMER_KEY || !USER_ID || !USER_SECRET) {
+      return res.status(500).json({ ok: false, error: "Missing config" });
+    }
+    const response = await snaptrade.authentication.loginSnapTradeUser({
+      userId: USER_ID,
+      userSecret: USER_SECRET,
+      connectionType: "trade"
+    });
+    console.log("[QuickTrade] Created Webull portal:", response.data);
+    res.json({ ok: true, redirectURI: response.data.redirectURI, sessionId: response.data.sessionId });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 app.get("/api/snaptrade/connect-portal", async (req, res) => {
   try {
@@ -1108,6 +1326,7 @@ app.post("/api/order", async (req, res) => {
     limitPrice,
     stopPrice,
     fillAggression, // 0–100 from slider
+    accountId,      // Selected trading account ID
   } = req.body || {};
 
   // ---------------- DEBUG: /api/order ----------------
@@ -1301,6 +1520,7 @@ app.post("/api/order", async (req, res) => {
       orderType,
       limitPrice: limitToSend,
       stopPrice: stopToSend,
+      accountId,
     });
 
     dbg("SNAPTRADE_ORDER_RESPONSE", {
@@ -1430,6 +1650,119 @@ try {
 // ------------- START SERVER -------------
 
 const PORT = 8000;
+
+// -------- AUTOMATED DAILY DEBRIEF (4:05 PM EST) --------
+app.post("/api/sleeper/scan", (req, res) => {
+  const scriptPath = path.join(__dirname, "../QuickTradeExtension/backend/sleeper_agent.py");
+  const command = `python "${scriptPath}"`;
+  
+  exec(command, { maxBuffer: 1024 * 1024 * 5, env: { ...process.env, PYTHONIOENCODING: "utf-8" } }, (error, stdout, stderr) => {
+    if (error) {
+      console.error(`[Sleeper AI Error]: ${error.message}`);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+    
+    try {
+      const match = stdout.match(/WATCHLIST:\s*(.+)/);
+      if (match && match[1]) {
+        const tickers = match[1].split(',').map(t => t.trim());
+        return res.json({ ok: true, tickers: tickers });
+      }
+      return res.status(500).json({ ok: false, error: "Failed to parse Google Gemini output" });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+});
+
+app.get("/api/sleeper/intel", (req, res) => {
+  const intelPath = path.join(__dirname, "../QuickTradeExtension/backend/sleeper_intel.json");
+  if (fs.existsSync(intelPath)) {
+    res.json(JSON.parse(fs.readFileSync(intelPath)));
+  } else {
+    res.status(404).json({error: "No sleeper intel"});
+  }
+});
+
+app.get("/api/dividend/intel", (req, res) => {
+  const intelPath = path.join(__dirname, "../QuickTradeExtension/backend/dividend_intel.json");
+  if (fs.existsSync(intelPath)) {
+    res.json(JSON.parse(fs.readFileSync(intelPath)));
+  } else {
+    res.status(404).json({error: "No dividend intel"});
+  }
+});
+
+app.get("/api/backtest/compare_intel", (req, res) => {
+  const intelPath = path.join(__dirname, "../QuickTradeExtension/backend/backtest_comparison.json");
+  if (fs.existsSync(intelPath)) {
+    res.json(JSON.parse(fs.readFileSync(intelPath)));
+  } else {
+    res.status(404).json({error: "No backtest compare intel"});
+  }
+});
+
+app.post("/api/backtest/compare", (req, res) => {
+    const { exec } = require('child_process');
+    const scriptPath = path.join(__dirname, "../QuickTradeExtension/backend/backtest_comparison.py");
+    exec(`python "${scriptPath}"`, (error, stdout, stderr) => {
+        if (error) {
+            console.error(`exec error: ${error}`);
+            return res.status(500).send("Error running backtest comparison");
+        }
+        res.status(200).send("Success");
+    });
+});
+
+
+app.get("/api/webull/gainers", (req, res) => {
+  const rankType = req.query.rank_type || "preMarket";
+  const count = req.query.count || 30;
+  
+  const scriptPath = path.join(__dirname, "../QuickTradeExtension/backend/webull_scraper.py");
+  const command = `python "${scriptPath}" --rank_type ${rankType} --count ${count}`;
+  
+  exec(command, { maxBuffer: 1024 * 1024, env: { ...process.env, PYTHONIOENCODING: "utf-8" } }, (error, stdout, stderr) => {
+    if (error) {
+      console.error(`[Webull Scraper Error]: ${error.message}`);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+    
+    try {
+      // Find JSON array in the stdout (ignoring warning logs)
+      const lines = stdout.split('\n');
+      for (const line of lines) {
+        if (line.trim().startsWith('{')) {
+          const data = JSON.parse(line.trim());
+          return res.json(data);
+        }
+      }
+      return res.status(500).json({ ok: false, error: "Failed to parse JSON from scraper" });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: "Parse error: " + e.message });
+    }
+  });
+});
+
+setInterval(() => {
+  const now = new Date();
+  const estString = now.toLocaleString("en-US", { timeZone: "America/New_York" });
+  const estDate = new Date(estString);
+  
+  // Check if it's exactly 16:05 (4:05 PM EST)
+  if (estDate.getHours() === 16 && estDate.getMinutes() === 5 && estDate.getSeconds() === 0) {
+    console.log("[QuickTrade] Market Closed. Running Automated AI Debrief...");
+    const scriptPath = path.join(__dirname, "../QuickTradeExtension/backend", "daily_debrief.py");
+    exec(`python "${scriptPath}"`, (error, stdout, stderr) => {
+      if (error) {
+        console.error("[QuickTrade] Debrief failed:", error.message);
+      } else {
+        console.log("[QuickTrade] Debrief completed:\n", stdout);
+      }
+    });
+  }
+}, 1000);
+
 app.listen(PORT, () => {
   console.log(
     `✅ QuickTrade REAL MONEY backend running on http://localhost:${PORT}`
