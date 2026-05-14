@@ -1,4 +1,4 @@
-import yfinance as yf
+﻿import yfinance as yf
 import time
 import sys
 sys.stdout.reconfigure(line_buffering=True, encoding='utf-8')
@@ -607,7 +607,7 @@ Respond ONLY with a valid JSON object matching this schema:
   }}
 }}"""
 
-        client = genai.Client()
+        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
         response = client.models.generate_content(
             model=ACTIVE_AI_MODEL,
             contents=prompt,

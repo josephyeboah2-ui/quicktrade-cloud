@@ -1,4 +1,4 @@
-import pandas as pd
+﻿import pandas as pd
 import json
 import os
 from google import genai
@@ -14,7 +14,7 @@ if not API_KEY:
     print("No Gemini API key found. Cannot run post-mortem.")
     exit(1)
 
-client = genai.Client()
+client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 def run_debrief():
     paper_path = os.path.join(os.path.dirname(__file__), 'PaperTrade_Journal.xlsx')

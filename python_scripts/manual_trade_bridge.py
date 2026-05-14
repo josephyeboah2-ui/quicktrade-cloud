@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 from excel_logger import log_trade, close_position
 
 def main():

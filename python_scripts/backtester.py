@@ -1,4 +1,4 @@
-import yfinance as yf
+﻿import yfinance as yf
 import pandas as pd
 import numpy as np
 import argparse
@@ -109,7 +109,7 @@ MAX_POSITION_SIZE = BALANCE * (RISK_PCT / 100.0)
 ACTIVE_AI_MODEL = "gemini-2.5-flash"
 
 try:
-    gemini_client = genai.Client()
+    gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 except:
     gemini_client = None
 
