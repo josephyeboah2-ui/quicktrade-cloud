@@ -1,4 +1,4 @@
-// server.js
+﻿// server.js
 // QuickTrade REAL MONEY backend using SnapTrade
 // - Serves:
 //     GET  /                               -> health check
@@ -1859,7 +1859,7 @@ setInterval(() => {
   }
 }, 1000);
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(
     `✅ QuickTrade REAL MONEY backend running on http://localhost:${PORT}`
   );
