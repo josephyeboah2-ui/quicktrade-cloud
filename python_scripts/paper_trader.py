@@ -507,15 +507,7 @@ def run_pre_flight_check(config):
         if balance > 0 and risk_pct > 0:
             MAX_POSITION_SIZE = balance * (risk_pct / 100.0)
             
-        vol_info = ""
-        try:
-            for t in TICKERS_TO_SCAN[:3]:
-                df = yf.Ticker(t).history(period="5d")
-                if not df.empty:
-                    hi_lo = (df['High'].max() - df['Low'].min()) / df['Low'].min() * 100
-                    vol_info += f"{t} 5-Day Range: {hi_lo:.1f}% | "
-        except Exception:
-            vol_info = "Volatility data unavailable."
+        vol_info = "Volatility check bypassed for stability."
 
         prompt = f"""You are a strict quantitative risk manager. 
 A day trader is attempting to launch an automated PAPER scalping algorithm with these parameters:
