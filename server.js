@@ -164,9 +164,11 @@ app.all("/api/proxy/:port/*path", async (req, res) => {
     // Don't forward body for GET/HEAD
     if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
       // Fast body forwarding for JSON
-      if (Object.keys(req.body).length > 0) {
-        fetchOptions.body = JSON.stringify(req.body);
+      if (req.body && Object.keys(req.body).length > 0) {
+        const bodyStr = JSON.stringify(req.body);
+        fetchOptions.body = bodyStr;
         fetchOptions.headers['Content-Type'] = 'application/json';
+        fetchOptions.headers['content-length'] = Buffer.byteLength(bodyStr).toString();
       }
     }
     
