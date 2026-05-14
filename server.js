@@ -1,4 +1,4 @@
-// server.js
+﻿// server.js
 // QuickTrade REAL MONEY backend using SnapTrade
 // - Serves:
 //     GET  /                               -> health check
@@ -21,7 +21,7 @@ process.on("uncaughtException", (err) => {
   console.error("[QuickTrade] Uncaught Exception (server stays alive):", err?.message || err);
 });
 
-const PYTHON_CMD = process.platform === "win32" ? "python" : "python3";
+const PYTHON_CMD = "python";
 const express = require("express");
 const bodyParser = require("body-parser");
 const cors = require("cors");
