@@ -4,7 +4,8 @@
   "description": "",
   "main": "node server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
   },
   "keywords": [],
   "author": "",
@@ -19,6 +20,7 @@
     "googleapis": "^167.0.0",
     "node-fetch": "^3.3.2",
     "open": "^11.0.0",
+    "pg": "^8.20.0",
     "snaptrade-typescript-sdk": "^9.0.152",
     "ws": "^8.18.3"
   }

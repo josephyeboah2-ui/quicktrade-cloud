@@ -1,0 +1,9 @@
+﻿yfinance
+pandas
+numpy
+requests
+python-dotenv
+google-genai
+webull
+psycopg2-binary
+openpyxl

@@ -1,4 +1,4 @@
-﻿// server.js
+// server.js
 // QuickTrade REAL MONEY backend using SnapTrade
 // - Serves:
 //     GET  /                               -> health check
@@ -25,6 +25,7 @@ const express = require("express");
 const bodyParser = require("body-parser");
 const cors = require("cors");
 const { Snaptrade } = require("snaptrade-typescript-sdk");
+const { Client } = require("pg");
 
 // -------- Finnhub Market Data (signals + quotes) --------
 const { start: startFinnhubWS, subscribe: finnhubSubscribe, fetchQuote } = require("./market/finnhubStream");
@@ -96,7 +97,7 @@ function spawnPythonBot(scriptName, reqBody) {
   }
   const { tickers, maxSize, maxLoss, takeProfitPct, trailingStopPct, broker, accountId, strategy } = reqBody;
   
-  const scriptPath = path.resolve(__dirname, `../QuickTradeExtension/backend/${scriptName}`);
+  const scriptPath = path.resolve(__dirname, `./python_scripts/${scriptName}`);
   const args = [scriptPath];
   
   if (tickers) args.push("--tickers", tickers);
@@ -107,6 +108,7 @@ function spawnPythonBot(scriptName, reqBody) {
   if (broker) args.push("--broker", broker);
   if (accountId) args.push("--account_id", accountId);
   if (strategy) args.push("--strategy", strategy);
+  if (reqBody.force) args.push("--force");
 
   console.log(`\n[QuickTrade] Spawning Python Bot: ${scriptName}`);
   const pyProcess = spawn("python", args, {
@@ -142,6 +144,43 @@ app.get("/api/bots/status", (req, res) => {
     live: !!activeBots["live_trader.py"],
     paper: !!activeBots["paper_trader.py"]
   });
+});
+
+// Proxy for Internal Python Servers (Railway only exposes 8000, but python runs on 8002/8003)
+app.all("/api/proxy/:port/*", async (req, res) => {
+  const port = req.params.port;
+  const targetPath = req.params[0];
+  const url = `http://localhost:${port}/${targetPath}`;
+  
+  try {
+    const fetch = (await import("node-fetch")).default;
+    const fetchOptions = {
+      method: req.method,
+      headers: { ...req.headers, host: `localhost:${port}` },
+    };
+    
+    // Don't forward body for GET/HEAD
+    if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
+      // Fast body forwarding for JSON
+      if (Object.keys(req.body).length > 0) {
+        fetchOptions.body = JSON.stringify(req.body);
+        fetchOptions.headers['Content-Type'] = 'application/json';
+      }
+    }
+    
+    const response = await fetch(url, fetchOptions);
+    const contentType = response.headers.get("content-type");
+    
+    if (contentType && contentType.includes("application/json")) {
+      const data = await response.json();
+      res.status(response.status).json(data);
+    } else {
+      const text = await response.text();
+      res.status(response.status).send(text);
+    }
+  } catch (err) {
+    res.status(502).json({ ok: false, error: "Internal Bot Server Unreachable" });
+  }
 });
 
 
@@ -184,7 +223,7 @@ app.post("/api/paper/stop", (req, res) => {
 app.post("/api/backtest", (req, res) => {
   const { tickers, days, balance, riskPct, dailyQuota, strategy } = req.body;
   const scriptName = "backtester.py";
-  const scriptPath = path.join(__dirname, "../QuickTradeExtension/backend", scriptName);
+  const scriptPath = path.join(__dirname, "./python_scripts", scriptName);
 
   let args = [];
   if (tickers) args.push("--tickers", `"${tickers}"`);
@@ -223,7 +262,7 @@ app.get("/api/history/:ticker", (req, res) => {
   const ticker = req.params.ticker;
   const period = req.query.period || "1mo";
   const scriptName = "fetch_history.py";
-  const scriptPath = path.join(__dirname, "../QuickTradeExtension/backend", scriptName);
+  const scriptPath = path.join(__dirname, "./python_scripts", scriptName);
 
   const command = `python "${scriptPath}" --ticker ${ticker} --period ${period}`;
   
@@ -1027,7 +1066,6 @@ app.delete("/api/snaptrade/connection", async (req, res) => {
 // ------------- REAL HOLDINGS ENDPOINT -------------
 
 app.get("/api/holdings", async (req, res) => {
-  console.log("[QuickTrade] /api/holdings (REAL)");
 
   try {
     ensureEnv();
@@ -1653,7 +1691,7 @@ const PORT = 8000;
 
 // -------- AUTOMATED DAILY DEBRIEF (4:05 PM EST) --------
 app.post("/api/sleeper/scan", (req, res) => {
-  const scriptPath = path.join(__dirname, "../QuickTradeExtension/backend/sleeper_agent.py");
+  const scriptPath = path.join(__dirname, "./python_scripts/sleeper_agent.py");
   const command = `python "${scriptPath}"`;
   
   exec(command, { maxBuffer: 1024 * 1024 * 5, env: { ...process.env, PYTHONIOENCODING: "utf-8" } }, (error, stdout, stderr) => {
@@ -1676,7 +1714,7 @@ app.post("/api/sleeper/scan", (req, res) => {
 });
 
 app.get("/api/sleeper/intel", (req, res) => {
-  const intelPath = path.join(__dirname, "../QuickTradeExtension/backend/sleeper_intel.json");
+  const intelPath = path.join(__dirname, "./python_scripts/sleeper_intel.json");
   if (fs.existsSync(intelPath)) {
     res.json(JSON.parse(fs.readFileSync(intelPath)));
   } else {
@@ -1685,7 +1723,7 @@ app.get("/api/sleeper/intel", (req, res) => {
 });
 
 app.get("/api/dividend/intel", (req, res) => {
-  const intelPath = path.join(__dirname, "../QuickTradeExtension/backend/dividend_intel.json");
+  const intelPath = path.join(__dirname, "./python_scripts/dividend_intel.json");
   if (fs.existsSync(intelPath)) {
     res.json(JSON.parse(fs.readFileSync(intelPath)));
   } else {
@@ -1694,7 +1732,7 @@ app.get("/api/dividend/intel", (req, res) => {
 });
 
 app.get("/api/backtest/compare_intel", (req, res) => {
-  const intelPath = path.join(__dirname, "../QuickTradeExtension/backend/backtest_comparison.json");
+  const intelPath = path.join(__dirname, "./python_scripts/backtest_comparison.json");
   if (fs.existsSync(intelPath)) {
     res.json(JSON.parse(fs.readFileSync(intelPath)));
   } else {
@@ -1704,7 +1742,7 @@ app.get("/api/backtest/compare_intel", (req, res) => {
 
 app.post("/api/backtest/compare", (req, res) => {
     const { exec } = require('child_process');
-    const scriptPath = path.join(__dirname, "../QuickTradeExtension/backend/backtest_comparison.py");
+    const scriptPath = path.join(__dirname, "./python_scripts/backtest_comparison.py");
     exec(`python "${scriptPath}"`, (error, stdout, stderr) => {
         if (error) {
             console.error(`exec error: ${error}`);
@@ -1719,7 +1757,7 @@ app.get("/api/webull/gainers", (req, res) => {
   const rankType = req.query.rank_type || "preMarket";
   const count = req.query.count || 30;
   
-  const scriptPath = path.join(__dirname, "../QuickTradeExtension/backend/webull_scraper.py");
+  const scriptPath = path.join(__dirname, "./python_scripts/webull_scraper.py");
   const command = `python "${scriptPath}" --rank_type ${rankType} --count ${count}`;
   
   exec(command, { maxBuffer: 1024 * 1024, env: { ...process.env, PYTHONIOENCODING: "utf-8" } }, (error, stdout, stderr) => {
@@ -1752,12 +1790,70 @@ setInterval(() => {
   // Check if it's exactly 16:05 (4:05 PM EST)
   if (estDate.getHours() === 16 && estDate.getMinutes() === 5 && estDate.getSeconds() === 0) {
     console.log("[QuickTrade] Market Closed. Running Automated AI Debrief...");
-    const scriptPath = path.join(__dirname, "../QuickTradeExtension/backend", "daily_debrief.py");
+    const scriptPath = path.join(__dirname, "./python_scripts", "daily_debrief.py");
     exec(`python "${scriptPath}"`, (error, stdout, stderr) => {
       if (error) {
         console.error("[QuickTrade] Debrief failed:", error.message);
       } else {
         console.log("[QuickTrade] Debrief completed:\n", stdout);
+      }
+    });
+  }
+
+  // Check if it's exactly 09:35 (9:35 AM EST) to log daily gainers for backtesting
+  if (estDate.getHours() === 9 && estDate.getMinutes() === 35 && estDate.getSeconds() === 0) {
+    console.log("[QuickTrade] Logging Morning Top Gainers...");
+    const scraperPath = path.join(__dirname, "./python_scripts", "webull_scraper.py");
+    exec(`python "${scraperPath}" --count 50`, (error, stdout, stderr) => {
+      if (error) {
+        console.error("[QuickTrade] Gainer logging failed:", error.message);
+      } else {
+        try {
+          const lines = stdout.split('\n');
+          let data = null;
+          for (const line of lines) {
+            if (line.trim().startsWith('{')) {
+              data = JSON.parse(line.trim());
+              break;
+            }
+          }
+          if (data && data.ok && data.tickers) {
+            const isoKey = estDate.toISOString().split('T')[0];
+            if (process.env.DATABASE_URL) {
+              const client = new Client({ connectionString: process.env.DATABASE_URL });
+              client.connect().then(() => {
+                  return client.query(`
+                      CREATE TABLE IF NOT EXISTS historical_gainers (
+                          date DATE PRIMARY KEY,
+                          tickers JSONB NOT NULL
+                      )
+                  `);
+              }).then(() => {
+                  return client.query(
+                      'INSERT INTO historical_gainers (date, tickers) VALUES ($1, $2) ON CONFLICT (date) DO UPDATE SET tickers = $2',
+                      [isoKey, JSON.stringify(data.tickers)]
+                  );
+              }).then(() => {
+                  console.log(`[QuickTrade] Successfully saved ${data.tickers.length} gainers for ${isoKey} to Postgres.`);
+                  client.end();
+              }).catch(err => {
+                  console.error("[QuickTrade] Postgres Error:", err.message);
+                  if (client) client.end();
+              });
+            } else {
+              const histFile = path.join(__dirname, "./python_scripts", "historical_gainers.json");
+              let histData = {};
+              if (fs.existsSync(histFile)) {
+                histData = JSON.parse(fs.readFileSync(histFile, 'utf8'));
+              }
+              histData[isoKey] = data.tickers;
+              fs.writeFileSync(histFile, JSON.stringify(histData, null, 2));
+              console.log(`[QuickTrade] Successfully saved ${data.tickers.length} gainers for ${isoKey} to local file.`);
+            }
+          }
+        } catch(e) {
+          console.error("Failed to save gainers:", e.message);
+        }
       }
     });
   }
