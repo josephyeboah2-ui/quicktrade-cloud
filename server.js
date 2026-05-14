@@ -21,6 +21,7 @@ process.on("uncaughtException", (err) => {
   console.error("[QuickTrade] Uncaught Exception (server stays alive):", err?.message || err);
 });
 
+const PYTHON_CMD = process.platform === "win32" ? "python" : "python3";
 const express = require("express");
 const bodyParser = require("body-parser");
 const cors = require("cors");
@@ -186,7 +187,7 @@ app.all("/api/proxy/:port/*path", async (req, res) => {
 
 app.get("/api/history", (req, res) => {
     const { exec } = require("child_process");
-    exec("python fetch_history.py", { cwd: __dirname }, (error, stdout, stderr) => {
+    exec("${PYTHON_CMD} fetch_history.py", { cwd: __dirname }, (error, stdout, stderr) => {
         if (error) {
             console.error("Error fetching history:", error);
             return res.json([]);
@@ -233,7 +234,7 @@ app.post("/api/backtest", (req, res) => {
   if (strategy) args.push("--strategy", strategy);
   if (dailyQuota) args.push("--daily_quota", dailyQuota);
 
-  const command = `python "${scriptPath}" ${args.join(" ")}`;
+  const command = `${PYTHON_CMD} "${scriptPath}" ${args.join(" ")}`;
   console.log(`[QuickTrade] Running Backtest: ${command}`);
 
   exec(command, { maxBuffer: 1024 * 1024 * 10, env: { ...process.env, PYTHONIOENCODING: "utf-8" } }, (error, stdout, stderr) => {
@@ -264,7 +265,7 @@ app.get("/api/history/:ticker", (req, res) => {
   const scriptName = "fetch_history.py";
   const scriptPath = path.join(__dirname, "./python_scripts", scriptName);
 
-  const command = `python "${scriptPath}" --ticker ${ticker} --period ${period}`;
+  const command = `${PYTHON_CMD} "${scriptPath}" --ticker ${ticker} --period ${period}`;
   
   exec(command, { maxBuffer: 1024 * 1024 * 2 }, (error, stdout, stderr) => {
     if (error) {
@@ -1692,7 +1693,7 @@ const PORT = process.env.PORT || 8000;
 // -------- AUTOMATED DAILY DEBRIEF (4:05 PM EST) --------
 app.post("/api/sleeper/scan", (req, res) => {
   const scriptPath = path.join(__dirname, "./python_scripts/sleeper_agent.py");
-  const command = `python "${scriptPath}"`;
+  const command = `${PYTHON_CMD} "${scriptPath}"`;
   
   exec(command, { maxBuffer: 1024 * 1024 * 5, env: { ...process.env, PYTHONIOENCODING: "utf-8" } }, (error, stdout, stderr) => {
     if (error) {
@@ -1743,7 +1744,7 @@ app.get("/api/backtest/compare_intel", (req, res) => {
 app.post("/api/backtest/compare", (req, res) => {
     const { exec } = require('child_process');
     const scriptPath = path.join(__dirname, "./python_scripts/backtest_comparison.py");
-    exec(`python "${scriptPath}"`, (error, stdout, stderr) => {
+    exec(`${PYTHON_CMD} "${scriptPath}"`, (error, stdout, stderr) => {
         if (error) {
             console.error(`exec error: ${error}`);
             return res.status(500).send("Error running backtest comparison");
@@ -1758,7 +1759,7 @@ app.get("/api/webull/gainers", (req, res) => {
   const count = req.query.count || 30;
   
   const scriptPath = path.join(__dirname, "./python_scripts/webull_scraper.py");
-  const command = `python "${scriptPath}" --rank_type ${rankType} --count ${count}`;
+  const command = `${PYTHON_CMD} "${scriptPath}" --rank_type ${rankType} --count ${count}`;
   
   exec(command, { maxBuffer: 1024 * 1024, env: { ...process.env, PYTHONIOENCODING: "utf-8" } }, (error, stdout, stderr) => {
     if (error) {
@@ -1791,7 +1792,7 @@ setInterval(() => {
   if (estDate.getHours() === 16 && estDate.getMinutes() === 5 && estDate.getSeconds() === 0) {
     console.log("[QuickTrade] Market Closed. Running Automated AI Debrief...");
     const scriptPath = path.join(__dirname, "./python_scripts", "daily_debrief.py");
-    exec(`python "${scriptPath}"`, (error, stdout, stderr) => {
+    exec(`${PYTHON_CMD} "${scriptPath}"`, (error, stdout, stderr) => {
       if (error) {
         console.error("[QuickTrade] Debrief failed:", error.message);
       } else {
@@ -1804,7 +1805,7 @@ setInterval(() => {
   if (estDate.getHours() === 9 && estDate.getMinutes() === 35 && estDate.getSeconds() === 0) {
     console.log("[QuickTrade] Logging Morning Top Gainers...");
     const scraperPath = path.join(__dirname, "./python_scripts", "webull_scraper.py");
-    exec(`python "${scraperPath}" --count 50`, (error, stdout, stderr) => {
+    exec(`${PYTHON_CMD} "${scraperPath}" --count 50`, (error, stdout, stderr) => {
       if (error) {
         console.error("[QuickTrade] Gainer logging failed:", error.message);
       } else {
