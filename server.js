@@ -1859,7 +1859,7 @@ setInterval(() => {
   }
 }, 1000);
 
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(Number(process.env.PORT) || 8000, "0.0.0.0", () => {
   console.log(
     `✅ QuickTrade REAL MONEY backend running on http://localhost:${PORT}`
   );
