@@ -1,4 +1,4 @@
-﻿// server.js
+// server.js
 // QuickTrade REAL MONEY backend using SnapTrade
 // - Serves:
 //     GET  /                               -> health check
@@ -150,7 +150,7 @@ app.get("/api/bots/status", (req, res) => {
 // Proxy for Internal Python Servers (Railway only exposes 8000, but python runs on 8002/8003)
 app.all("/api/proxy/:port/*path", async (req, res) => {
   const port = req.params.port;
-  const targetPath = req.params.path || "";
+  const targetPath = Array.isArray(req.params.path) ? req.params.path.join("/") : (req.params.path || "");
   const url = `http://localhost:${port}/${targetPath}`;
   
   try {
