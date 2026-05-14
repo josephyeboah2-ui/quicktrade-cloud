@@ -1,4 +1,4 @@
-﻿// server.js
+// server.js
 // QuickTrade REAL MONEY backend using SnapTrade
 // - Serves:
 //     GET  /                               -> health check
@@ -159,6 +159,7 @@ app.all("/api/proxy/:port/*path", async (req, res) => {
       method: req.method,
       headers: { ...req.headers, host: `localhost:${port}` },
     };
+    delete fetchOptions.headers['content-length'];
     
     // Don't forward body for GET/HEAD
     if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
