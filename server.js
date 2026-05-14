@@ -1687,7 +1687,7 @@ try {
 
 // ------------- START SERVER -------------
 
-const PORT = 8000;
+const PORT = process.env.PORT || 8000;
 
 // -------- AUTOMATED DAILY DEBRIEF (4:05 PM EST) --------
 app.post("/api/sleeper/scan", (req, res) => {
