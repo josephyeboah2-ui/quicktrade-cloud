@@ -426,7 +426,7 @@ def run_dividend_manager():
 
 threading.Thread(target=run_dividend_manager, daemon=True).start()
 
-def dynamic_webull_top_gainers():
+def dynamic_webull_top_gainers(): return
     global TICKERS_TO_SCAN
     if not webull:
         return
@@ -450,7 +450,7 @@ def dynamic_webull_top_gainers():
             pass
         time.sleep(300)
 
-threading.Thread(target=dynamic_webull_top_gainers, daemon=True).start()
+# threading.Thread(target=dynamic_webull_top_gainers, daemon=True).start()
 
 def run_pre_flight_check(config):
     global PRE_FLIGHT_STATE, PRE_FLIGHT_DATA, TICKERS_TO_SCAN, MAX_POSITION_SIZE, MAX_DAILY_LOSS, TAKE_PROFIT_PCT, TRAILING_STOP_PCT, DAILY_QUOTA, ACTIVE_STRATEGIES, LIMIT_ONLY
