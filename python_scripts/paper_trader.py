@@ -42,6 +42,7 @@ if args.force:
 LIMIT_ONLY = False
 MODE_LABEL = "STANDARD"
 STARTING_BALANCE = 0.0
+COMMISSION_PER_ORDER = 1.00  # IBKR charges $1 per order; $2 per round-trip (BUY + SELL)
 ACTIVE_STRATEGIES = ['STANDARD'] if args.strategy == 'standard' else (['AGGRESSIVE'] if args.strategy == 'aggressive' else ['STANDARD', 'AGGRESSIVE'])
 
 TICKERS_TO_SCAN = [t.strip().upper() for t in args.tickers.split(',') if t.strip()]
@@ -792,6 +793,15 @@ class PaperTrader:
                     else:
                         qty = max(1, int(MAX_POSITION_SIZE / price))
                         trail = TRAILING_STOP_PCT
+
+                    # --- IBKR FEE FILTER ---
+                    # Only enter if expected gain on a modest 2% move > round-trip commission ($2)
+                    round_trip_fee = COMMISSION_PER_ORDER * 2
+                    expected_gain_2pct = qty * price * 0.02
+                    if expected_gain_2pct <= round_trip_fee:
+                        print(f"   ⚠️ [FEE FILTER] Skipping {ticker}: expected 2% gain ${expected_gain_2pct:.2f} ≤ fee ${round_trip_fee:.2f}. Too small to be worth it.")
+                        return
+                    # --- END FEE FILTER ---
                     self.positions[pos_key] = {
                         "entry_price": price, "qty": qty, "initial_qty": qty,
                         "highest_price": price, "entry_time_ms": time.time(),
@@ -1074,7 +1084,10 @@ Respond ONLY with a valid JSON object. Include a scale_out_plan if you want to s
                 print(f"[PAPER SIGNAL] [{strategy}] {reason} on {ticker} at ${price}")
                 exit_slippage = simulate_slippage(price, current_vol, avg_vol)
                 actual_exit = price - exit_slippage
-                trade_pnl = (actual_exit - entry_price) * qty
+                gross_pnl = (actual_exit - entry_price) * qty
+                # Deduct IBKR round-trip commission ($1 buy + $1 sell)
+                round_trip_fee = COMMISSION_PER_ORDER * 2
+                trade_pnl = gross_pnl - round_trip_fee
                 self.daily_pnl += trade_pnl
                 close_position("PaperTrade_Journal.csv", ticker, price, actual_exit, exit_slippage, strategy=strategy)
                 pl_color = "#00ff6a" if trade_pnl >= 0 else "#ff4a4a"
@@ -1087,6 +1100,8 @@ Respond ONLY with a valid JSON object. Include a scale_out_plan if you want to s
                     "exit_price": round(actual_exit, 4),
                     "entry_price": round(entry_price, 4),
                     "pl": round(trade_pnl, 2),
+                    "fee": round_trip_fee,
+                    "gross_pl": round(gross_pnl, 2),
                     "plColor": pl_color,
                     "time": datetime.datetime.now().strftime("%m/%d %I:%M:%S %p"),
                     "reason": reason,
