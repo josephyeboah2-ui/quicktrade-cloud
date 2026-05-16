@@ -1,0 +1,2 @@
+Date,Ticker,Side,Quantity,Expected_Price,Execution_Price,Exit_Price,Entry_Slippage,Exit_Slippage,PnL,Signal_Reason,Status,Strategy
+2026-05-15 22:22:13,BNZI,BUY,100,8.01,8.0313,,0.0213,0.0,,Volume Spike (>300%),OPEN,STANDARD

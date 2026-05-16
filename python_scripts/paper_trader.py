@@ -1,4 +1,4 @@
-﻿import yfinance as yf
+import yfinance as yf
 import time
 import sys
 sys.stdout.reconfigure(line_buffering=True, encoding='utf-8')
@@ -19,6 +19,7 @@ try:
 except ImportError:
     webull = None
 from excel_logger import log_trade, close_position, generate_weekly_report
+from local_intel_engine import query_local_intel, record_trade_outcome, get_brain_summary
 
 env_path = os.path.join(os.path.dirname(__file__), '../../QuickTradeBackend/.env')
 load_dotenv(dotenv_path=env_path)
@@ -47,6 +48,29 @@ PRICE_MIN = 0.30
 PRICE_MAX = 100.00
 POLL_INTERVAL_SECONDS = 5
 
+ticker_context_cache = {}
+
+def _refresh_l2_cache():
+    """Background thread: refreshes bid/ask sizes for all scanned tickers every 30s.
+    This feeds the L2 Order Book Defense System with real data."""
+    import concurrent.futures
+    def _fetch_one(tkr):
+        try:
+            info = yf.Ticker(tkr).info
+            return tkr, int(info.get("bidSize") or 1), int(info.get("askSize") or 1)
+        except:
+            return tkr, 1, 1
+    while True:
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+                for tkr, bid, ask in ex.map(_fetch_one, TICKERS_TO_SCAN):
+                    ticker_context_cache[tkr] = {"bidSize": bid, "askSize": ask}
+        except Exception as e:
+            pass  # Never let this crash the main bot
+        time.sleep(30)
+
+threading.Thread(target=_refresh_l2_cache, daemon=True).start()
+
 MAX_POSITION_SIZE = args.max_size
 MAX_DAILY_LOSS = args.max_loss
 TAKE_PROFIT_PCT = args.take_profit
@@ -67,11 +91,11 @@ PRE_FLIGHT_STATE = "WAITING_FOR_CONFIG"
 PRE_FLIGHT_DATA = {}
 bot_trades_log = []
 try:
-    j_path = os.path.join(os.path.dirname(__file__), "PaperTrade_Journal.xlsx")
+    j_path = os.path.join(os.path.dirname(__file__), "PaperTrade_Journal.csv")
     if os.path.exists(j_path):
         import pandas as pd
         import time
-        df = pd.read_excel(j_path)
+        df = pd.read_csv(j_path)
         for idx, row in df.iterrows():
             px = row.get("Execution_Price", row.get("Entry_Price", 0))
             if pd.isna(px): px = 0
@@ -194,6 +218,19 @@ class BotTradeHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(json.dumps({"status": "ok"}).encode())
+        elif self.path == '/api/bot-trades/clear':
+            global bot_trades_log
+            bot_trades_log.clear()
+            try:
+                j_path = os.path.join(os.path.dirname(__file__), "PaperTrade_Journal.csv")
+                if os.path.exists(j_path):
+                    os.remove(j_path)
+            except Exception as e:
+                print("Failed to delete journal file:", e)
+            self.send_response(200)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "ok"}).encode())
         elif self.path == '/api/sleeper/start':
             content_length = int(self.headers.get('Content-Length', 0))
             if content_length > 0:
@@ -305,10 +342,10 @@ class BotTradeHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             try:
                 base_dir = os.path.dirname(os.path.abspath(__file__))
-                file_name = 'PaperTrade_Journal.xlsx' if 'paper' in __file__ else 'LiveTrade_Journal.xlsx'
+                file_name = 'PaperTrade_Journal.csv' if 'paper' in __file__ else 'LiveTrade_Journal.csv'
                 file_path = os.path.join(base_dir, file_name)
                 if os.path.exists(file_path):
-                    df = pd.read_excel(file_path)
+                    df = pd.read_csv(file_path)
                     # Convert dates safely
                     json_str = df.to_json(orient='records', date_format='iso')
                     self.wfile.write(json_str.encode())
@@ -426,7 +463,7 @@ def run_dividend_manager():
 
 threading.Thread(target=run_dividend_manager, daemon=True).start()
 
-def dynamic_webull_top_gainers(): return
+def dynamic_webull_top_gainers():
     global TICKERS_TO_SCAN
     if not webull:
         return
@@ -450,7 +487,7 @@ def dynamic_webull_top_gainers(): return
             pass
         time.sleep(300)
 
-# threading.Thread(target=dynamic_webull_top_gainers, daemon=True).start()
+threading.Thread(target=dynamic_webull_top_gainers, daemon=True).start()
 
 def run_pre_flight_check(config):
     global PRE_FLIGHT_STATE, PRE_FLIGHT_DATA, TICKERS_TO_SCAN, MAX_POSITION_SIZE, MAX_DAILY_LOSS, TAKE_PROFIT_PCT, TRAILING_STOP_PCT, DAILY_QUOTA, ACTIVE_STRATEGIES, LIMIT_ONLY
@@ -460,7 +497,11 @@ def run_pre_flight_check(config):
         return
 
     try:
-        TICKERS_TO_SCAN = config.get("tickers", TICKERS_TO_SCAN)
+        raw_tickers = config.get("tickers", TICKERS_TO_SCAN)
+        if isinstance(raw_tickers, str):
+            TICKERS_TO_SCAN = [t.strip().upper() for t in raw_tickers.split(",") if t.strip() and "LOADING" not in t.strip().upper()]
+        else:
+            TICKERS_TO_SCAN = [t for t in raw_tickers if "LOADING" not in str(t).upper()]
         MAX_POSITION_SIZE = float(config.get("max_size", MAX_POSITION_SIZE))
         MAX_DAILY_LOSS = float(config.get("max_loss", MAX_DAILY_LOSS))
         TAKE_PROFIT_PCT = float(config.get("take_profit", TAKE_PROFIT_PCT))
@@ -570,6 +611,8 @@ class PaperTrader:
         self.consecutive_losses = 0
         self.last_ai_query = {}
         self.daily_pnl = 0.0
+        self.last_activity_str = ""
+        self.last_activity_time = 0
         try:
             self.gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
         except Exception:
@@ -591,7 +634,7 @@ class PaperTrader:
         top_ticker = None
         top_roc = -999
         top_stats = ""
-        for ticker in TICKERS_TO_SCAN:
+        for ticker in TICKERS_TO_SCAN[:]:
              try:
                  data = yf.Ticker(ticker).history(period='2d', interval='15m', prepost=True)
                  if data.empty or len(data) < 25:
@@ -610,6 +653,7 @@ class PaperTrader:
                  data['VWAP'] = data.groupby(data.index.date)['Vol_Price'].cumsum() / data.groupby(data.index.date)['Volume'].cumsum()
                  
                  current_price = round(data['Close'].iloc[-1], 2)
+                 realtime_prices[ticker] = current_price
                  current_vol = data['Volume'].iloc[-1]
                  avg_vol = data['Vol_SMA'].iloc[-1]
                  ema9 = data['EMA9'].iloc[-1]
@@ -621,6 +665,11 @@ class PaperTrader:
                  prev_price = round(data['Close'].iloc[-2], 2)
                  roc = ((current_price - prev_price) / prev_price) * 100
 
+                 if roc > top_roc:
+                     top_roc = roc
+                     top_ticker = ticker
+                     top_stats = f"${current_price} | Vol: {current_vol}"
+
                  if not (PRICE_MIN <= current_price <= PRICE_MAX):
                      continue
 
@@ -631,7 +680,12 @@ class PaperTrader:
                  print(f"[ALGO] Error fetching {ticker}: {e}")
              
         if top_ticker:
-            print(f"   [ACTIVITY] Watching {len(TICKERS_TO_SCAN)} stocks. Hottest right now: {top_ticker} -> {top_stats}")
+            activity_str = f"   [ACTIVITY] Watching {len(TICKERS_TO_SCAN)} stocks. Hottest right now: {top_ticker} -> {top_stats}"
+            current_time = time.time()
+            if activity_str != self.last_activity_str or (current_time - self.last_activity_time) >= 180:
+                print(activity_str)
+                self.last_activity_str = activity_str
+                self.last_activity_time = current_time
             
     def evaluate_algo(self, ticker, strategy, price, ema9, ema21, prev_ema9, prev_ema21, current_vol, avg_vol, roc, vwap=0.0):
         pos_key = f"{ticker}_{strategy}"
@@ -664,7 +718,41 @@ class PaperTrader:
                 if now - self.last_ai_query.get(pos_key, 0) < 300:
                     return
                 self.last_ai_query[pos_key] = now
-                
+
+                # --- LOCAL BRAIN FIRST ---
+                # Check if we have enough local intel to decide without Gemini
+                local_result = query_local_intel(strategy, price, current_vol, avg_vol, roc, vwap, ticker=ticker)
+                local_decision = local_result.get("decision")
+                local_samples = local_result.get("samples", 0)
+
+                if local_decision == "APPROVED":
+                    print(f"\n🧠 [LOCAL BRAIN] {ticker} — {local_result['reasoning']}")
+                    qty = max(1, int(MAX_POSITION_SIZE / price))
+                    self.positions[pos_key] = {
+                        "entry_price": price, "qty": qty, "initial_qty": qty,
+                        "highest_price": price, "entry_time_ms": time.time(),
+                        "trailing_stop_pct": TRAILING_STOP_PCT, "scale_out_plan": [],
+                        "entry_vol": current_vol, "entry_avg_vol": avg_vol,
+                        "entry_roc": roc, "entry_vwap": vwap
+                    }
+                    entry_slippage = simulate_slippage(price, current_vol, avg_vol)
+                    execution_price = price + entry_slippage
+                    log_trade("PaperTrade_Journal.csv", ticker, "BUY", qty, price, execution_price, entry_slippage, signal_reason, strategy=strategy)
+                    bot_trades_log.append({
+                        "id": int(time.time() * 1000), "sym": ticker, "side": "BUY",
+                        "qty": qty, "price": execution_price,
+                        "time": datetime.datetime.now().strftime("%m/%d %I:%M:%S %p"),
+                        "reason": f"[LOCAL BRAIN] {signal_reason} ({local_samples} samples)"
+                    })
+                    return
+                elif local_decision == "REJECTED":
+                    print(f"\n🧠 [LOCAL BRAIN] SKIPPING {ticker} — {local_result['reasoning']}")
+                    return
+                else:
+                    if local_samples > 0:
+                        print(f"\n🧠 [LOCAL BRAIN] Uncertain on {ticker} ({local_samples} samples). Deferring to Gemini.")
+                # --- END LOCAL BRAIN ---
+
                 if self.gemini_client:
                     # --- AI PLAYBOOK & MEMORY INJECTION ---
                     playbook_context = ""
@@ -778,18 +866,22 @@ Respond ONLY with a valid JSON object. Include a scale_out_plan if you want to s
                                 "highest_price": price,
                                 "entry_time_ms": time.time(),
                                 "trailing_stop_pct": ai_trail,
-                                "scale_out_plan": scale_plan
+                                "scale_out_plan": scale_plan,
+                                "entry_vol": current_vol,
+                                "entry_avg_vol": avg_vol,
+                                "entry_roc": roc,
+                                "entry_vwap": vwap
                             }
                             entry_slippage = simulate_slippage(price, current_vol, avg_vol)
                             execution_price = price + entry_slippage
-                            log_trade("PaperTrade_Journal.xlsx", ticker, "BUY", qty, price, execution_price, entry_slippage, signal_reason, strategy=strategy)
+                            log_trade("PaperTrade_Journal.csv", ticker, "BUY", qty, price, execution_price, entry_slippage, signal_reason, strategy=strategy)
                             bot_trades_log.append({
                                 "id": int(time.time() * 1000),
                                 "sym": ticker,
                                 "side": "BUY",
                                 "qty": qty,
                                 "price": execution_price,
-                                "time": datetime.now().strftime("%m/%d %I:%M:%S %p"),
+                                "time": datetime.datetime.now().strftime("%m/%d %I:%M:%S %p"),
                                 "reason": f"[PAPER] {signal_reason}"
                             })
                         else:
@@ -800,18 +892,21 @@ Respond ONLY with a valid JSON object. Include a scale_out_plan if you want to s
                         print(f"⚠️ [PAPER] Gemini API Error: {e}")
                         return
                 else:
-                    qty = 100
+                    # No Gemini AI — calculate shares from the user's configured MAX_POSITION_SIZE budget
+                    qty = max(1, int(MAX_POSITION_SIZE / price))
+                    cost = qty * price
+                    print(f"[PAPER] No-AI fallback buy: {qty} shares of {ticker} @ ${price:.2f} = ${cost:.2f} (budget: ${MAX_POSITION_SIZE:.2f})")
                     self.positions[pos_key] = { "entry_price": price, "qty": qty, "highest_price": price, "trailing_stop_pct": TRAILING_STOP_PCT }
                     entry_slippage = simulate_slippage(price, current_vol, avg_vol)
                     execution_price = price + entry_slippage
-                    log_trade("PaperTrade_Journal.xlsx", ticker, "BUY", qty, price, execution_price, entry_slippage, signal_reason, strategy=strategy)
+                    log_trade("PaperTrade_Journal.csv", ticker, "BUY", qty, price, execution_price, entry_slippage, signal_reason, strategy=strategy)
                     bot_trades_log.append({
                         "id": int(time.time() * 1000),
                         "sym": ticker,
                         "side": "BUY",
                         "qty": qty,
                         "price": execution_price,
-                        "time": datetime.now().strftime("%m/%d %I:%M:%S %p"),
+                        "time": datetime.datetime.now().strftime("%m/%d %I:%M:%S %p"),
                         "reason": f"[PAPER] {signal_reason}"
                     })
 
@@ -873,7 +968,7 @@ Respond ONLY with a valid JSON object. Include a scale_out_plan if you want to s
                                 "side": "SELL",
                                 "qty": scale_qty,
                                 "price": price,
-                                "time": datetime.now().strftime("%m/%d %I:%M:%S %p"),
+                                "time": datetime.datetime.now().strftime("%m/%d %I:%M:%S %p"),
                                 "reason": f"Scale Out (+{next_scale.get('target_pct')}%)"
                             })
                             qty = self.positions[pos_key]["qty"]
@@ -901,20 +996,28 @@ Respond ONLY with a valid JSON object. Include a scale_out_plan if you want to s
                 actual_exit = price - exit_slippage
                 trade_pnl = (actual_exit - entry_price) * qty
                 self.daily_pnl += trade_pnl
-                close_position("PaperTrade_Journal.xlsx", ticker, price, actual_exit, exit_slippage, strategy=strategy)
+                close_position("PaperTrade_Journal.csv", ticker, price, actual_exit, exit_slippage, strategy=strategy)
                 bot_trades_log.append({
                     "id": int(time.time() * 1000),
                     "sym": ticker,
                     "side": "SELL",
                     "qty": qty,
                     "price": actual_exit,
-                    "time": datetime.now().strftime("%m/%d %I:%M:%S %p"),
+                    "time": datetime.datetime.now().strftime("%m/%d %I:%M:%S %p"),
                     "reason": reason
                 })
+                # --- TEACH THE LOCAL BRAIN ---
+                entry_vol = self.positions[pos_key].get("entry_vol", current_vol)
+                entry_avg_vol = self.positions[pos_key].get("entry_avg_vol", avg_vol)
+                entry_roc = self.positions[pos_key].get("entry_roc", roc)
+                entry_vwap = self.positions[pos_key].get("entry_vwap", vwap)
+                record_trade_outcome(strategy, entry_price, entry_vol, entry_avg_vol, entry_roc, entry_vwap, pnl=trade_pnl, ticker=ticker)
+                # --- END TEACHING ---
+
                 del self.positions[pos_key]
                 if trade_pnl < 0:
                     self.consecutive_losses += 1
-                    print(f"?? [RISK ALERT] Consecutive Losses: {self.consecutive_losses}")
+                    print(f"⚠️ [RISK ALERT] Consecutive Losses: {self.consecutive_losses}")
                 else:
                     self.consecutive_losses = 0
 

@@ -1,4 +1,4 @@
-﻿import yfinance as yf
+import yfinance as yf
 import pandas as pd
 import numpy as np
 import argparse
@@ -9,6 +9,7 @@ import os
 import psycopg2
 from dotenv import load_dotenv
 from google import genai
+from local_intel_engine import record_trade_outcome
 
 env_path = os.path.join(os.path.dirname(__file__), '../../QuickTradeBackend/.env')
 load_dotenv(dotenv_path=env_path)
@@ -241,7 +242,11 @@ def process_ticker(ticker):
                                     "entry_index": i,
                                     "initial_qty": qty,
                                     "qty": qty,
-                                    "scale_out_plan": scale_plan
+                                    "scale_out_plan": scale_plan,
+                                    "entry_vol": vol,
+                                    "entry_avg_vol": avg_vol,
+                                    "entry_roc": roc,
+                                    "entry_vwap": vwap
                                 }
                 else:
                     pos = positions[strategy]
@@ -282,6 +287,10 @@ def process_ticker(ticker):
                                     })
                                     pos["qty"] -= scale_qty
                                     pos["scale_out_plan"].pop(0)
+                                    # Teach the brain from this partial exit
+                                    try:
+                                        record_trade_outcome(strategy, pos["entry_price"], pos.get("entry_vol", avg_vol), pos.get("entry_avg_vol", avg_vol), pos.get("entry_roc", roc), pos.get("entry_vwap", vwap), pnl=pnl, ticker=ticker)
+                                    except Exception: pass
                     
                     if not sell_reason:
                         if (i - pos.get("entry_index", i)) > 1: # 15m candle = 1 period
@@ -312,6 +321,10 @@ def process_ticker(ticker):
                             "trail_pct": pos["trail_pct"]
                         })
                         del positions[strategy]
+                        # Teach the brain from this closed trade
+                        try:
+                            record_trade_outcome(strategy, pos["entry_price"], pos.get("entry_vol", avg_vol), pos.get("entry_avg_vol", avg_vol), pos.get("entry_roc", roc), pos.get("entry_vwap", vwap), pnl=pnl, ticker=ticker)
+                        except Exception: pass
     except Exception as e:
         print(f"Error: {e}")
     return trades

@@ -1,4 +1,4 @@
-﻿import yfinance as yf
+import yfinance as yf
 import time
 import sys
 sys.stdout.reconfigure(line_buffering=True, encoding='utf-8')
@@ -21,6 +21,7 @@ try:
 except ImportError:
     webull = None
 from excel_logger import log_trade, close_position
+from local_intel_engine import record_trade_outcome
 
 env_path = os.path.join(os.path.dirname(__file__), '../../QuickTradeBackend/.env')
 load_dotenv(dotenv_path=env_path)
@@ -72,11 +73,11 @@ ticker_context_cache = {}
 ACTIVE_AI_MODEL = "gemini-2.5-flash"
 bot_trades_log = []
 try:
-    j_path = os.path.join(os.path.dirname(__file__), "LiveTrade_Journal.xlsx")
+    j_path = os.path.join(os.path.dirname(__file__), "LiveTrade_Journal.csv")
     if os.path.exists(j_path):
         import pandas as pd
         import time
-        df = pd.read_excel(j_path)
+        df = pd.read_csv(j_path)
         for idx, row in df.iterrows():
             px = row.get("Execution_Price", row.get("Entry_Price", 0))
             if pd.isna(px): px = 0
@@ -320,10 +321,11 @@ class BotTradeHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             try:
                 base_dir = os.path.dirname(os.path.abspath(__file__))
-                file_name = 'PaperTrade_Journal.xlsx' if 'paper' in __file__ else 'LiveTrade_Journal.xlsx'
+                file_name = 'PaperTrade_Journal.csv' if 'paper' in __file__ else 'LiveTrade_Journal.csv'
                 file_path = os.path.join(base_dir, file_name)
                 if os.path.exists(file_path):
-                    df = pd.read_excel(file_path)
+                    import pandas as pd
+                    df = pd.read_csv(file_path)
                     # Convert dates safely
                     json_str = df.to_json(orient='records', date_format='iso')
                     self.wfile.write(json_str.encode())
@@ -1153,13 +1155,17 @@ Respond ONLY with a valid JSON object. Include a scale_out_plan if you want to s
                                 "highest_price": price,
                                 "entry_time_ms": time.time(),
                                 "trailing_stop_pct": ai_trail,
-                                "scale_out_plan": scale_plan
+                                "scale_out_plan": scale_plan,
+                                "entry_vol": current_vol,
+                                "entry_avg_vol": avg_vol,
+                                "entry_roc": roc,
+                                "entry_vwap": vwap
                             }
                             print(f"\n✅ [LIVE SIGNAL] [{strategy}] {signal_reason} on {ticker}. AI APPROVED size: ${qty * price:.2f}")
                             entry_slippage = simulate_slippage(price, current_vol, avg_vol)
                             execution_price = price + entry_slippage
                             self.execute_live_snaptrade_order(ticker, "BUY", qty, price, signal_reason)
-                            log_trade("LiveTrade_Journal.xlsx", ticker, "BUY", qty, price, execution_price, entry_slippage, signal_reason, strategy=strategy)
+                            log_trade("LiveTrade_Journal.csv", ticker, "BUY", qty, price, execution_price, entry_slippage, signal_reason, strategy=strategy)
                         else:
                             print(f"🛑 Trade skipped for {ticker} because Gemini rejected the setup.")
                             
@@ -1257,7 +1263,14 @@ Respond ONLY with a valid JSON object. Include a scale_out_plan if you want to s
                 
                 exit_slippage = simulate_slippage(price, current_vol, avg_vol)
                 actual_exit = price - exit_slippage
-                close_position("LiveTrade_Journal.xlsx", ticker, price, actual_exit, exit_slippage, strategy=strategy)
+                close_position("LiveTrade_Journal.csv", ticker, price, actual_exit, exit_slippage, strategy=strategy)
+                # --- TEACH THE LOCAL BRAIN (REAL MONEY = HIGHEST QUALITY SIGNAL) ---
+                entry_vol = self.positions[pos_key].get("entry_vol", current_vol)
+                entry_avg_vol = self.positions[pos_key].get("entry_avg_vol", avg_vol)
+                entry_roc = self.positions[pos_key].get("entry_roc", roc)
+                entry_vwap = self.positions[pos_key].get("entry_vwap", vwap)
+                record_trade_outcome(strategy, entry_price, entry_vol, entry_avg_vol, entry_roc, entry_vwap, pnl=trade_pnl, ticker=ticker)
+                # --- END TEACHING ---
                 del self.positions[pos_key]
                 if trade_pnl < 0:
                     self.consecutive_losses += 1

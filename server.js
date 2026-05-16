@@ -112,8 +112,8 @@ function spawnPythonBot(scriptName, reqBody) {
   if (reqBody.force) args.push("--force");
 
   console.log(`\n[QuickTrade] Spawning Python Bot: ${scriptName}`);
-  const pyProcess = spawn("python", args, {
-    env: { ...process.env, PYTHONIOENCODING: "utf-8" }
+  const pyProcess = spawn("python", ["-u", ...args], {
+    env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUNBUFFERED: "1" }
   });
 
   activeBots[scriptName] = pyProcess;

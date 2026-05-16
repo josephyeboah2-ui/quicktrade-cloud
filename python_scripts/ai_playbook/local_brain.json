@@ -1,0 +1,80 @@
+{
+  "STANDARD__LOW_CAP_5TO15__VOL_5X__ROC_MED__POWER_HOUR__ABOVE_VWAP": {
+    "total": 19,
+    "wins": 16,
+    "total_pnl": 183.0,
+    "avg_pnl": 9.6316,
+    "win_rate": 0.8421,
+    "last_seen": "2026-05-15 22:42:36",
+    "last_decision": "APPROVED",
+    "sample_tickers": [
+      "BNZI"
+    ]
+  },
+  "STANDARD__LOW_CAP_5TO15__VOL_3X__ROC_MED__POWER_HOUR__ABOVE_VWAP": {
+    "total": 477,
+    "wins": 331,
+    "total_pnl": 2229.5,
+    "avg_pnl": 4.674,
+    "win_rate": 0.6939,
+    "last_seen": "2026-05-15 22:39:13",
+    "last_decision": "APPROVED",
+    "sample_tickers": [
+      "WOLF",
+      "SPRB",
+      "AGH",
+      "BMNR"
+    ]
+  },
+  "STANDARD__LOW_CAP_5TO15__VOL_3X__ROC_FLAT__POWER_HOUR__ABOVE_VWAP": {
+    "total": 67,
+    "wins": 48,
+    "total_pnl": 332.0,
+    "avg_pnl": 4.9552,
+    "win_rate": 0.7164,
+    "last_seen": "2026-05-15 22:39:13",
+    "last_decision": "APPROVED",
+    "sample_tickers": [
+      "BW",
+      "OPEN",
+      "FLNC"
+    ]
+  },
+  "STANDARD__PENNY_1TO5__VOL_3X__ROC_MED__POWER_HOUR__ABOVE_VWAP": {
+    "total": 78,
+    "wins": 62,
+    "total_pnl": 463.0,
+    "avg_pnl": 5.9359,
+    "win_rate": 0.7949,
+    "last_seen": "2026-05-15 22:39:10",
+    "last_decision": "APPROVED",
+    "sample_tickers": [
+      "LWLG",
+      "SOGP"
+    ]
+  },
+  "STANDARD__LOW_CAP_5TO15__VOL_3X__ROC_MED__MORNING_MID__ABOVE_VWAP": {
+    "total": 400,
+    "wins": 261,
+    "total_pnl": 19470.0,
+    "avg_pnl": 48.675,
+    "win_rate": 0.6525,
+    "last_seen": "2026-05-11 (90-day backtest)",
+    "last_decision": "APPROVED",
+    "sample_tickers": [
+      "BACKTEST"
+    ]
+  },
+  "AGGRESSIVE__LOW_CAP_5TO15__VOL_3X__ROC_MED__MORNING_MID__ABOVE_VWAP": {
+    "total": 400,
+    "wins": 246,
+    "total_pnl": 32930.0,
+    "avg_pnl": 82.325,
+    "win_rate": 0.615,
+    "last_seen": "2026-05-11 (90-day backtest)",
+    "last_decision": "APPROVED",
+    "sample_tickers": [
+      "BACKTEST"
+    ]
+  }
+}
