@@ -40,6 +40,8 @@ if args.force:
     PRE_FLIGHT_STATE = "APPROVED"
 
 LIMIT_ONLY = False
+MODE_LABEL = "STANDARD"
+STARTING_BALANCE = 0.0
 ACTIVE_STRATEGIES = ['STANDARD'] if args.strategy == 'standard' else (['AGGRESSIVE'] if args.strategy == 'aggressive' else ['STANDARD', 'AGGRESSIVE'])
 
 TICKERS_TO_SCAN = [t.strip().upper() for t in args.tickers.split(',') if t.strip()]
@@ -285,7 +287,11 @@ class BotTradeHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             
-            self.wfile.write(json.dumps({'trades': bot_trades_log}).encode())
+            self.wfile.write(json.dumps({
+                'trades': bot_trades_log,
+                'starting_balance': STARTING_BALANCE,
+                'mode_label': MODE_LABEL
+            }).encode())
         elif self.path == '/api/bot-prices':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
@@ -490,7 +496,7 @@ def dynamic_webull_top_gainers():
 threading.Thread(target=dynamic_webull_top_gainers, daemon=True).start()
 
 def run_pre_flight_check(config):
-    global PRE_FLIGHT_STATE, PRE_FLIGHT_DATA, TICKERS_TO_SCAN, MAX_POSITION_SIZE, MAX_DAILY_LOSS, TAKE_PROFIT_PCT, TRAILING_STOP_PCT, DAILY_QUOTA, ACTIVE_STRATEGIES, LIMIT_ONLY
+    global PRE_FLIGHT_STATE, PRE_FLIGHT_DATA, TICKERS_TO_SCAN, MAX_POSITION_SIZE, MAX_DAILY_LOSS, TAKE_PROFIT_PCT, TRAILING_STOP_PCT, DAILY_QUOTA, ACTIVE_STRATEGIES, LIMIT_ONLY, MODE_LABEL, STARTING_BALANCE
     
     if config.get("force", False):
         PRE_FLIGHT_STATE = "APPROVED"
@@ -512,18 +518,14 @@ def run_pre_flight_check(config):
         ui_limit = config.get("limitOnly", False)
         
         if ui_strategy == "auto_pilot":
+            # AUTO-PILOT: always use limit orders regardless of backtest suggestion
+            LIMIT_ONLY = True
+            MODE_LABEL = "AUTO-PILOT"
             try:
                 b_path = os.path.join(os.path.dirname(__file__), "backtest_comparison.json")
                 with open(b_path, "r") as bf:
                     best = json.load(bf).get("best_strategy", {}).get("strategy", "")
-                    if "Limit" in best:
-                        ui_limit = True
-                    else:
-                        ui_limit = False
-                        
-                    if "Standard" in best:
-                        ui_strategy = "standard"
-                    elif "Aggressive" in best:
+                    if "Aggressive" in best:
                         ui_strategy = "aggressive"
                     else:
                         ui_strategy = "standard"
@@ -534,16 +536,20 @@ def run_pre_flight_check(config):
         LIMIT_ONLY = ui_limit
         if ui_strategy == 'standard':
             ACTIVE_STRATEGIES = ['STANDARD']
+            if MODE_LABEL != "AUTO-PILOT": MODE_LABEL = "STANDARD"
         elif ui_strategy == 'aggressive':
             ACTIVE_STRATEGIES = ['AGGRESSIVE']
+            if MODE_LABEL != "AUTO-PILOT": MODE_LABEL = "AGGRESSIVE"
         else:
             ACTIVE_STRATEGIES = ['STANDARD', 'AGGRESSIVE']
+            if MODE_LABEL != "AUTO-PILOT": MODE_LABEL = "BOTH"
         # --------------------------------
         
         DAILY_QUOTA = float(config.get("daily_quota", 0))
         daily_quota = DAILY_QUOTA
         risk_pct = float(config.get("risk_pct", 0))
         balance = float(config.get("balance", 0))
+        STARTING_BALANCE = balance
         
         if balance > 0 and risk_pct > 0:
             MAX_POSITION_SIZE = balance * (risk_pct / 100.0)
@@ -703,6 +709,18 @@ class PaperTrader:
                     signal_reason = "EMA Crossover (9 > 21)"
                 elif is_vol_spike:
                     signal_reason = "Volume Spike (>300%)"
+                else:
+                    # L2 BID PRESSURE: check order book imbalance as early pre-surge signal
+                    l2 = ticker_context_cache.get(ticker, {})
+                    bid = l2.get("bid", 0)
+                    ask = l2.get("ask", 0)
+                    bid_size = l2.get("bid_size", 0)
+                    ask_size = l2.get("ask_size", 1)
+                    if bid > 0 and ask > 0 and bid_size > 0 and ask_size > 0:
+                        imbalance_ratio = bid_size / ask_size
+                        spread_pct = (ask - bid) / bid * 100 if bid > 0 else 999
+                        if imbalance_ratio >= 2.0 and spread_pct < 1.5 and price > vwap:
+                            signal_reason = f"Order Book Pressure (Bid {imbalance_ratio:.1f}x Ask)"
                     
             elif strategy == 'AGGRESSIVE':
                 is_vol_spike = current_vol > 50000 and current_vol > (avg_vol * TUNED_PARAMS["vol_multiplier"])
