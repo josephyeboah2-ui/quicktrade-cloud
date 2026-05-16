@@ -619,6 +619,7 @@ class PaperTrader:
         self.daily_pnl = 0.0
         self.last_activity_str = ""
         self.last_activity_time = 0
+        self.roc_history = {}  # ticker -> deque of last 5 ROC values for uptick detection
         try:
             self.gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
         except Exception:
@@ -679,6 +680,12 @@ class PaperTrader:
                  if not (PRICE_MIN <= current_price <= PRICE_MAX):
                      continue
 
+                 # Track ROC history per ticker for uptick momentum detection
+                 from collections import deque
+                 if ticker not in self.roc_history:
+                     self.roc_history[ticker] = deque(maxlen=5)
+                 self.roc_history[ticker].append(roc)
+
                  for strategy in ACTIVE_STRATEGIES:
                      self.evaluate_algo(ticker, strategy, current_price, ema9, ema21, prev_ema9, prev_ema21, current_vol, avg_vol, roc, vwap)
                  
@@ -701,26 +708,55 @@ class PaperTrader:
             if strategy == 'STANDARD':
                 is_crossover = (prev_ema9 < prev_ema21) and (ema9 > ema21)
                 is_vol_spike = (current_vol > (avg_vol * 3))
-                
+                is_mini = False  # mini-surge flag → smaller size, tighter stop
+
                 if current_vol < 50000 or price < ema21:
                     return
-                
+
                 if is_crossover:
                     signal_reason = "EMA Crossover (9 > 21)"
                 elif is_vol_spike:
                     signal_reason = "Volume Spike (>300%)"
                 else:
-                    # L2 BID PRESSURE: check order book imbalance as early pre-surge signal
-                    l2 = ticker_context_cache.get(ticker, {})
-                    bid = l2.get("bid", 0)
-                    ask = l2.get("ask", 0)
-                    bid_size = l2.get("bid_size", 0)
-                    ask_size = l2.get("ask_size", 1)
-                    if bid > 0 and ask > 0 and bid_size > 0 and ask_size > 0:
-                        imbalance_ratio = bid_size / ask_size
-                        spread_pct = (ask - bid) / bid * 100 if bid > 0 else 999
-                        if imbalance_ratio >= 2.0 and spread_pct < 1.5 and price > vwap:
-                            signal_reason = f"Order Book Pressure (Bid {imbalance_ratio:.1f}x Ask)"
+                    # ── MINI-SURGE SIGNAL 1: Volume Accumulation ─────────────────
+                    # Volume 1.5x-2.5x (building up, not yet spiked) + positive ROC + above VWAP
+                    vol_ratio = current_vol / avg_vol if avg_vol > 0 else 0
+                    if 1.5 <= vol_ratio < 3.0 and roc > 0.4 and price > vwap:
+                        signal_reason = f"Volume Accumulation ({vol_ratio:.1f}x avg, ROC +{roc:.2f}%)"
+                        is_mini = True
+
+                    # ── MINI-SURGE SIGNAL 2: Consecutive Uptick Momentum ─────────
+                    # 3+ consecutive positive ROC ticks = sustained buying pressure
+                    if not signal_reason:
+                        rocs = list(self.roc_history.get(ticker, []))
+                        if len(rocs) >= 3 and all(r > 0 for r in rocs[-3:]) and price > vwap:
+                            total_move = sum(rocs[-3:])
+                            if total_move > 0.6:  # at least 0.6% cumulative move over 3 ticks
+                                signal_reason = f"3-Tick Momentum ({total_move:.2f}% cumulative)"
+                                is_mini = True
+
+                    # ── MINI-SURGE SIGNAL 3: VWAP Bounce ─────────────────────────
+                    # Price just crossed above VWAP from below with volume building
+                    if not signal_reason:
+                        prev_below_vwap = prev_ema9 < vwap  # use prev_ema9 as proxy for prev price
+                        just_crossed_vwap = prev_below_vwap and price > vwap
+                        if just_crossed_vwap and vol_ratio >= 1.3 and roc > 0.2:
+                            signal_reason = f"VWAP Bounce (Vol {vol_ratio:.1f}x, ROC +{roc:.2f}%)"
+                            is_mini = True
+
+                    # ── L2 BID PRESSURE ───────────────────────────────────────────
+                    if not signal_reason:
+                        l2 = ticker_context_cache.get(ticker, {})
+                        bid = l2.get("bid", 0)
+                        ask = l2.get("ask", 0)
+                        bid_size = l2.get("bid_size", 0)
+                        ask_size = l2.get("ask_size", 1)
+                        if bid > 0 and ask > 0 and bid_size > 0 and ask_size > 0:
+                            imbalance_ratio = bid_size / ask_size
+                            spread_pct = (ask - bid) / bid * 100 if bid > 0 else 999
+                            if imbalance_ratio >= 2.0 and spread_pct < 1.5 and price > vwap:
+                                signal_reason = f"Order Book Pressure (Bid {imbalance_ratio:.1f}x Ask)"
+                                is_mini = True
                     
             elif strategy == 'AGGRESSIVE':
                 is_vol_spike = current_vol > 50000 and current_vol > (avg_vol * TUNED_PARAMS["vol_multiplier"])
@@ -733,9 +769,12 @@ class PaperTrader:
                     
             if signal_reason:
                 now = time.time()
-                if now - self.last_ai_query.get(pos_key, 0) < 300:
+                # Mini-surge signals use shorter cooldown so the bot can re-engage quickly
+                cooldown = 90 if (strategy == 'STANDARD' and 'is_mini' in dir() and is_mini) else 300
+                if now - self.last_ai_query.get(pos_key, 0) < cooldown:
                     return
                 self.last_ai_query[pos_key] = now
+                is_mini_signal = 'is_mini' in dir() and is_mini
 
                 # --- LOCAL BRAIN FIRST ---
                 # Check if we have enough local intel to decide without Gemini
@@ -745,11 +784,19 @@ class PaperTrader:
 
                 if local_decision == "APPROVED":
                     print(f"\n🧠 [LOCAL BRAIN] {ticker} — {local_result['reasoning']}")
-                    qty = max(1, int(MAX_POSITION_SIZE / price))
+                    # Mini-surge: use 50% position size + tighter 2% trailing stop
+                    if is_mini_signal:
+                        qty = max(1, int((MAX_POSITION_SIZE * 0.5) / price))
+                        trail = 2.0
+                        print(f"   [MINI-SURGE] Smaller size ({qty} shares) + 2% trail — will widen to 4% if move extends")
+                    else:
+                        qty = max(1, int(MAX_POSITION_SIZE / price))
+                        trail = TRAILING_STOP_PCT
                     self.positions[pos_key] = {
                         "entry_price": price, "qty": qty, "initial_qty": qty,
                         "highest_price": price, "entry_time_ms": time.time(),
-                        "trailing_stop_pct": TRAILING_STOP_PCT, "scale_out_plan": [],
+                        "trailing_stop_pct": trail, "scale_out_plan": [],
+                        "is_mini": is_mini_signal,
                         "entry_vol": current_vol, "entry_avg_vol": avg_vol,
                         "entry_roc": roc, "entry_vwap": vwap
                     }
@@ -936,7 +983,17 @@ Respond ONLY with a valid JSON object. Include a scale_out_plan if you want to s
             if price > highest_price:
                 self.positions[pos_key]["highest_price"] = price
                 highest_price = price
-                  
+
+            # --- MINI-SURGE → FULL SURGE UPGRADE ---
+            # If a mini-surge entry has grown 3%+, widen the trail to ride the full move
+            if self.positions[pos_key].get("is_mini") and self.positions[pos_key].get("trailing_stop_pct", 99) < 3.0:
+                unrealized_pct = ((price - entry_price) / entry_price) * 100
+                if unrealized_pct >= 3.0:
+                    self.positions[pos_key]["trailing_stop_pct"] = TRAILING_STOP_PCT  # widen to standard (4%)
+                    self.positions[pos_key]["is_mini"] = False  # graduated to full position
+                    print(f"🚀 [MINI→SURGE] {ticker} up {unrealized_pct:.1f}%! Trail widened to {TRAILING_STOP_PCT}% — riding the wave!")
+            # --- END MINI UPGRADE ---
+
             # --- L2 ORDER BOOK DEFENSE SYSTEM ---
             ctx = ticker_context_cache.get(ticker, {"bidSize": 1, "askSize": 1})
             bids = ctx.get("bidSize", 1)
