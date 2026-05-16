@@ -1,4 +1,4 @@
-﻿import yfinance as yf
+import yfinance as yf
 import pandas as pd
 import json
 import os
@@ -84,12 +84,14 @@ def run_tuner():
             print(f"Tested ROC: {r}%, Vol: {v}x -> PnL: ${pnl:.2f}")
             if pnl > best_pnl:
                 best_pnl = pnl
-                best_params = {"roc": r, "vol_multiplier": v}
-                
-    print(f"\n[DONE] Tuning Complete. Optimal Params: ROC > {best_params['roc']}%, Vol > {best_params['vol_multiplier']}x")
+                best_roc, best_vol = r, v
+        
+    best_params = {"roc": best_roc, "vol_multiplier": best_vol}
+    print("\n[DONE] Tuning Complete. Optimal Params: ROC > {:.1f}%, Vol > {:.1f}x".format(best_roc, best_vol))
     print(f"Projected Weekly PnL: ${best_pnl:.2f}")
     
-    with open('tuned_params.json', 'w') as f:
+    save_path = os.path.join(os.path.dirname(__file__), 'tuned_params.json')
+    with open(save_path, 'w') as f:
         json.dump(best_params, f)
 
 def evolve_tags():

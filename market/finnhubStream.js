@@ -55,8 +55,8 @@ function connect() {
 
   ws.on("error", (err) => {
     if (err.message && err.message.includes("429")) {
-      reconnectDelay = Math.min(reconnectDelay * 2, 120000); // backoff up to 2 min
-      console.warn(`[Finnhub WS] Rate limited (429), backing off to ${reconnectDelay / 1000}s`);
+      reconnectDelay = 86400000; // 24-hour backoff ban for hard 429 limits
+      console.warn(`[Finnhub WS] Rate limited (429) by API provider. Going into deep sleep for 24 hours before next reconnect attempt.`);
     } else {
       console.warn("[Finnhub WS] Error:", err.message);
     }

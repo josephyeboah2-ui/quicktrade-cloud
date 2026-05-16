@@ -1,11 +1,11 @@
 {
   "STANDARD__LOW_CAP_5TO15__VOL_5X__ROC_MED__POWER_HOUR__ABOVE_VWAP": {
-    "total": 19,
-    "wins": 16,
-    "total_pnl": 183.0,
-    "avg_pnl": 9.6316,
-    "win_rate": 0.8421,
-    "last_seen": "2026-05-15 22:42:36",
+    "total": 25,
+    "wins": 21,
+    "total_pnl": 240.0,
+    "avg_pnl": 9.6,
+    "win_rate": 0.84,
+    "last_seen": "2026-05-16 03:40:09",
     "last_decision": "APPROVED",
     "sample_tickers": [
       "BNZI"
