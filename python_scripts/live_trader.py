@@ -1191,9 +1191,33 @@ Respond ONLY with a valid JSON object. Include a scale_out_plan if you want to s
                         return
                         
                     except Exception as e:
-                        print(f"⚠️ Gemini API Error: {e}")
-                        print(f"🛑 Trade skipped for {ticker} due to AI failure.")
+                        err_str = str(e)
+                        if "403" in err_str or "PERMISSION_DENIED" in err_str:
+                            print(f"⚠️ [LIVE] Gemini unavailable (403). Rule-based fallback for {ticker}.")
+                        else:
+                            print(f"⚠️ Gemini API Error: {e}. Rule-based fallback for {ticker}.")
+
+                        # --- RULE-BASED FALLBACK (Gemini offline) ---
+                        fb_qty = max(1, int(MAX_POSITION_SIZE / price))
+                        round_trip_fee = COMMISSION_PER_ORDER * 2
+                        if fb_qty * price * 0.02 <= round_trip_fee:
+                            print(f"   ⚠️ [FEE FILTER] Fallback: skipping {ticker} — too small to cover fee.")
+                            return
+                        print(f"✅ [RULE-BASED LIVE] {ticker} | {fb_qty} sh @ ${price:.2f} | Trail: {TRAILING_STOP_PCT}%")
+                        self.positions[pos_key] = {
+                            "entry_price": price, "qty": fb_qty, "initial_qty": fb_qty,
+                            "highest_price": price, "entry_time_ms": time.time(),
+                            "trailing_stop_pct": TRAILING_STOP_PCT, "scale_out_plan": [],
+                            "entry_vol": current_vol, "entry_avg_vol": avg_vol,
+                            "entry_roc": roc, "entry_vwap": vwap
+                        }
+                        entry_slippage = simulate_slippage(price, current_vol, avg_vol)
+                        execution_price = price + entry_slippage
+                        self.execute_live_snaptrade_order(ticker, "BUY", fb_qty, price, f"[RULE-BASED] {signal_reason}")
+                        log_trade("LiveTrade_Journal.csv", ticker, "BUY", fb_qty, price, execution_price, entry_slippage, f"[RULE-BASED] {signal_reason}", strategy=strategy)
                         return
+                        # --- END RULE-BASED FALLBACK ---
+
                 
         # SELL LOGIC
         else:

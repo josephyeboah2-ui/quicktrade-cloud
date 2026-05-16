@@ -964,8 +964,46 @@ Respond ONLY with a valid JSON object. Include a scale_out_plan if you want to s
                         return
                         
                     except Exception as e:
-                        print(f"⚠️ [PAPER] Gemini API Error: {e}")
+                        err_str = str(e)
+                        if "403" in err_str or "PERMISSION_DENIED" in err_str:
+                            print(f"⚠️ [PAPER] Gemini API unavailable (403). Switching to rule-based approval for {ticker}.")
+                        else:
+                            print(f"⚠️ [PAPER] Gemini API Error: {e}. Using rule-based fallback.")
+
+                        # --- RULE-BASED FALLBACK (Gemini offline) ---
+                        # Signal already passed all filters. Approve using local sizing rules.
+                        fb_size = MAX_POSITION_SIZE * 0.5 if is_mini_signal else MAX_POSITION_SIZE
+                        fb_trail = 2.0 if is_mini_signal else TRAILING_STOP_PCT
+                        fb_qty = max(1, int(fb_size / price))
+
+                        # Fee filter still applies
+                        round_trip_fee = COMMISSION_PER_ORDER * 2
+                        if fb_qty * price * 0.02 <= round_trip_fee:
+                            print(f"   ⚠️ [FEE FILTER] Fallback: skipping {ticker} — position too small to cover fee.")
+                            return
+
+                        print(f"✅ [RULE-BASED] {ticker} approved | {fb_qty} shares @ ${price:.2f} | Trail: {fb_trail}% | Signal: {signal_reason}")
+                        self.positions[pos_key] = {
+                            "entry_price": price, "qty": fb_qty, "initial_qty": fb_qty,
+                            "highest_price": price, "entry_time_ms": time.time(),
+                            "trailing_stop_pct": fb_trail, "scale_out_plan": [],
+                            "is_mini": is_mini_signal,
+                            "entry_vol": current_vol, "entry_avg_vol": avg_vol,
+                            "entry_roc": roc, "entry_vwap": vwap
+                        }
+                        entry_slippage = simulate_slippage(price, current_vol, avg_vol)
+                        execution_price = price + entry_slippage
+                        log_trade("PaperTrade_Journal.csv", ticker, "BUY", fb_qty, price, execution_price, entry_slippage, f"[RULE-BASED] {signal_reason}", strategy=strategy)
+                        bot_trades_log.append({
+                            "id": int(time.time() * 1000), "sym": ticker, "side": "BUY",
+                            "qty": fb_qty, "price": execution_price,
+                            "entry_price": round(price, 4),
+                            "time": datetime.datetime.now().strftime("%m/%d %I:%M:%S %p"),
+                            "reason": f"[RULE-BASED] {signal_reason}",
+                            "strategy": strategy
+                        })
                         return
+                        # --- END RULE-BASED FALLBACK ---
                 else:
                     # No Gemini AI — calculate shares from the user's configured MAX_POSITION_SIZE budget
                     qty = max(1, int(MAX_POSITION_SIZE / price))
