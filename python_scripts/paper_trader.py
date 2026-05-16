@@ -961,13 +961,18 @@ Respond ONLY with a valid JSON object. Include a scale_out_plan if you want to s
                             print(f"🚀 [PAPER] AI Scaling Out: Locked in {next_scale.get('scale_pct')*100}% at +{next_scale.get('target_pct')}%")
                             self.positions[pos_key]["qty"] -= scale_qty
                             self.positions[pos_key]["scale_out_plan"].pop(0) # Remove executed target
-                            pnl = (price - entry_price) * scale_qty
+                            scale_pnl = (price - entry_price) * scale_qty
+                            pl_color = "#00ff6a" if scale_pnl >= 0 else "#ff4a4a"
                             bot_trades_log.append({
                                 "id": int(time.time() * 1000),
                                 "sym": ticker,
                                 "side": "SELL",
                                 "qty": scale_qty,
                                 "price": price,
+                                "exit_price": round(price, 4),
+                                "entry_price": round(entry_price, 4),
+                                "pl": round(scale_pnl, 2),
+                                "plColor": pl_color,
                                 "time": datetime.datetime.now().strftime("%m/%d %I:%M:%S %p"),
                                 "reason": f"Scale Out (+{next_scale.get('target_pct')}%)"
                             })
@@ -997,14 +1002,21 @@ Respond ONLY with a valid JSON object. Include a scale_out_plan if you want to s
                 trade_pnl = (actual_exit - entry_price) * qty
                 self.daily_pnl += trade_pnl
                 close_position("PaperTrade_Journal.csv", ticker, price, actual_exit, exit_slippage, strategy=strategy)
+                pl_color = "#00ff6a" if trade_pnl >= 0 else "#ff4a4a"
                 bot_trades_log.append({
                     "id": int(time.time() * 1000),
                     "sym": ticker,
                     "side": "SELL",
                     "qty": qty,
                     "price": actual_exit,
+                    "exit_price": round(actual_exit, 4),
+                    "entry_price": round(entry_price, 4),
+                    "pl": round(trade_pnl, 2),
+                    "plColor": pl_color,
                     "time": datetime.datetime.now().strftime("%m/%d %I:%M:%S %p"),
-                    "reason": reason
+                    "reason": reason,
+                    "strategy": strategy,
+                    "status": "CLOSED"
                 })
                 # --- TEACH THE LOCAL BRAIN ---
                 entry_vol = self.positions[pos_key].get("entry_vol", current_vol)
