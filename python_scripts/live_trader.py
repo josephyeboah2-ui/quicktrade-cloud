@@ -46,6 +46,9 @@ if args.force:
     PRE_FLIGHT_STATE = "APPROVED"
 
 LIMIT_ONLY = False
+MODE_LABEL = "STANDARD"
+STARTING_BALANCE = 0.0
+COMMISSION_PER_ORDER = 1.00  # IBKR: $1 per order, $2 per round-trip
 ACTIVE_STRATEGIES = ['STANDARD'] if args.strategy == 'standard' else (['AGGRESSIVE'] if args.strategy == 'aggressive' else ['STANDARD', 'AGGRESSIVE'])
 
 # Configuration
@@ -348,7 +351,11 @@ class BotTradeHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Content-type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            self.wfile.write(json.dumps({"trades": bot_trades_log}).encode())
+            self.wfile.write(json.dumps({
+                "trades": bot_trades_log,
+                "starting_balance": STARTING_BALANCE,
+                "mode_label": MODE_LABEL
+            }).encode())
         elif self.path == '/api/bot-prices':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
@@ -514,7 +521,7 @@ threading.Thread(target=dynamic_webull_top_gainers, daemon=True).start()
 
 
 def run_pre_flight_check(config):
-    global PRE_FLIGHT_STATE, PRE_FLIGHT_DATA, TICKERS_TO_SCAN, MAX_POSITION_SIZE, MAX_DAILY_LOSS, TAKE_PROFIT_PCT, TRAILING_STOP_PCT, DAILY_QUOTA, ACTIVE_STRATEGIES, LIMIT_ONLY
+    global PRE_FLIGHT_STATE, PRE_FLIGHT_DATA, TICKERS_TO_SCAN, MAX_POSITION_SIZE, MAX_DAILY_LOSS, TAKE_PROFIT_PCT, TRAILING_STOP_PCT, DAILY_QUOTA, ACTIVE_STRATEGIES, LIMIT_ONLY, MODE_LABEL, STARTING_BALANCE
     
     if config.get("force", False):
         PRE_FLIGHT_STATE = "APPROVED"
@@ -555,10 +562,13 @@ def run_pre_flight_check(config):
         LIMIT_ONLY = ui_limit
         if ui_strategy == 'standard':
             ACTIVE_STRATEGIES = ['STANDARD']
+            if MODE_LABEL != "AUTO-PILOT": MODE_LABEL = "STANDARD"
         elif ui_strategy == 'aggressive':
             ACTIVE_STRATEGIES = ['AGGRESSIVE']
+            if MODE_LABEL != "AUTO-PILOT": MODE_LABEL = "AGGRESSIVE"
         else:
             ACTIVE_STRATEGIES = ['STANDARD', 'AGGRESSIVE']
+            if MODE_LABEL != "AUTO-PILOT": MODE_LABEL = "BOTH"
         # --------------------------------
         
         DAILY_QUOTA = float(config.get("daily_quota", 0))
@@ -567,6 +577,7 @@ def run_pre_flight_check(config):
         balance = float(config.get("balance", 0))
         
         # Automatically calculate MAX_POSITION_SIZE from risk % and balance
+        STARTING_BALANCE = balance
         if balance > 0 and risk_pct > 0:
             MAX_POSITION_SIZE = balance * (risk_pct / 100.0)
             
@@ -1143,6 +1154,14 @@ Respond ONLY with a valid JSON object. Include a scale_out_plan if you want to s
                             
                             qty = max(1, int(actual_size / price))
                             ai_trail = float(ai_data.get("trailing_stop_pct", TRAILING_STOP_PCT))
+
+                            # --- IBKR FEE FILTER ---
+                            round_trip_fee = COMMISSION_PER_ORDER * 2
+                            expected_gain_2pct = qty * price * 0.02
+                            if expected_gain_2pct <= round_trip_fee:
+                                print(f"   ⚠️ [FEE FILTER] Skipping {ticker}: expected 2% gain ${expected_gain_2pct:.2f} ≤ fee ${round_trip_fee:.2f}. Not worth it.")
+                                return
+                            # --- END FEE FILTER ---
                             
                             scale_plan = ai_data.get("scale_out_plan", [])
                             if (qty * price) < 500.0:
@@ -1244,8 +1263,8 @@ Respond ONLY with a valid JSON object. Include a scale_out_plan if you want to s
                 # Standard mode uses Take Profit. Aggressive mode ignores it to ride the surge infinitely.
                 if strategy == 'STANDARD' and price >= take_profit_price:
                     trade_gross_pnl = (price - entry_price) * qty
-                    if args.broker == "ibkr" and trade_gross_pnl <= 2.0:
-                        print(f"⏳ [{ticker}] Take Profit reached but gross profit (${trade_gross_pnl:.2f}) doesn't cover $2 IBKR fee. Waiting.")
+                    if trade_gross_pnl <= COMMISSION_PER_ORDER * 2:
+                        print(f"⏳ [{ticker}] Take Profit reached but gross profit (${trade_gross_pnl:.2f}) doesn't cover fee. Waiting.")
                     elif is_rocketing:
                         print(f"🚀 [{ticker}] Take Profit target reached, but momentum is strong! Letting it ride.")
                     else:
@@ -1254,9 +1273,9 @@ Respond ONLY with a valid JSON object. Include a scale_out_plan if you want to s
                     sell_reason = f"Trailing Stop Hit (Locked in gains from ${highest_price:.2f})" if highest_price > entry_price else "Stop Loss Hit"
                 
             if sell_reason:
-                trade_pnl = (price - entry_price) * qty
-                if args.broker == "ibkr":
-                    trade_pnl -= 2.00 # Factor in $1 execution fee for BUY and $1 for SELL
+                gross_pnl = (price - entry_price) * qty
+                round_trip_fee = COMMISSION_PER_ORDER * 2
+                trade_pnl = gross_pnl - round_trip_fee
                 self.daily_pnl += trade_pnl
                 
                 self.execute_live_snaptrade_order(ticker, "SELL", qty, price, sell_reason)
@@ -1264,6 +1283,25 @@ Respond ONLY with a valid JSON object. Include a scale_out_plan if you want to s
                 exit_slippage = simulate_slippage(price, current_vol, avg_vol)
                 actual_exit = price - exit_slippage
                 close_position("LiveTrade_Journal.csv", ticker, price, actual_exit, exit_slippage, strategy=strategy)
+                # --- LOG SELL TO TRADE REPORT ---
+                pl_color = "#00ff6a" if trade_pnl >= 0 else "#ff4a4a"
+                bot_trades_log.append({
+                    "id": int(time.time() * 1000),
+                    "sym": ticker,
+                    "side": "SELL",
+                    "qty": qty,
+                    "price": actual_exit,
+                    "exit_price": round(actual_exit, 4),
+                    "entry_price": round(entry_price, 4),
+                    "pl": round(trade_pnl, 2),
+                    "gross_pl": round(gross_pnl, 2),
+                    "fee": round_trip_fee,
+                    "plColor": pl_color,
+                    "time": datetime.now().strftime("%m/%d %I:%M:%S %p"),
+                    "reason": sell_reason,
+                    "strategy": strategy,
+                    "status": "CLOSED"
+                })
                 # --- TEACH THE LOCAL BRAIN (REAL MONEY = HIGHEST QUALITY SIGNAL) ---
                 entry_vol = self.positions[pos_key].get("entry_vol", current_vol)
                 entry_avg_vol = self.positions[pos_key].get("entry_avg_vol", avg_vol)
