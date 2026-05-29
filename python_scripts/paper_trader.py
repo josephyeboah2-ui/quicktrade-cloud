@@ -585,12 +585,26 @@ Respond ONLY with a valid JSON object matching this schema:
   }}
 }}"""
 
-        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-        response = client.models.generate_content(
-            model=ACTIVE_AI_MODEL,
-            contents=prompt,
-        )
-        
+        # ── Gemini risk evaluation — 25s hard timeout ──────────────────────────
+        # Without a timeout the Gemini call blocks indefinitely, keeping
+        # PRE_FLIGHT_STATE="ANALYZING" and hanging the UI pre-flight modal.
+        import concurrent.futures as _cf
+        _gemini_key = os.environ.get("GEMINI_API_KEY")
+        def _call_gemini():
+            return genai.Client(api_key=_gemini_key).models.generate_content(
+                model=ACTIVE_AI_MODEL,
+                contents=prompt,
+            )
+        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+            _fut = _ex.submit(_call_gemini)
+            try:
+                response = _fut.result(timeout=25)
+            except _cf.TimeoutError:
+                print("⚠️ Pre-Flight Gemini timeout (25s) — auto-approving")
+                PRE_FLIGHT_STATE = "APPROVED"
+                return
+        # ───────────────────────────────────────────────────────────────────────
+
         txt = response.text.replace('```json', '').replace('```', '').strip()
         result = json.loads(txt)
         
@@ -603,6 +617,7 @@ Respond ONLY with a valid JSON object matching this schema:
     except Exception as e:
         print(f"⚠️ Pre-Flight Check failed: {e}")
         PRE_FLIGHT_STATE = "APPROVED"
+
 
 def simulate_slippage(price, current_vol, avg_vol):
     import random
