@@ -22,11 +22,13 @@ process.on("uncaughtException", (err) => {
 });
 
 const PYTHON_CMD = "python";
-const express = require("express");
+const express    = require("express");
 const bodyParser = require("body-parser");
-const cors = require("cors");
+const cors       = require("cors");
+const path       = require("path");
+const fs         = require("fs");
 const { Snaptrade } = require("snaptrade-typescript-sdk");
-const { Client } = require("pg");
+const { Client }    = require("pg");
 
 // -------- Finnhub Market Data (signals + quotes) --------
 const { start: startFinnhubWS, subscribe: finnhubSubscribe, fetchQuote } = require("./market/finnhubStream");
@@ -40,20 +42,38 @@ const FINNHUB_KEY = process.env.Finnhub_KEY || "";
 
 // ---------------- ENV ----------------
 
-const CLIENT_ID = process.env.SNAPTRADE_CLIENT_ID;
+const CLIENT_ID    = process.env.SNAPTRADE_CLIENT_ID;
 const CONSUMER_KEY = process.env.SNAPTRADE_CONSUMER_KEY;
-const USER_ID = process.env.SNAPTRADE_USER_ID;
-const USER_SECRET = process.env.SNAPTRADE_USER_SECRET;
-const ACCOUNT_ID = process.env.SNAPTRADE_ACCOUNT_ID;
-const BROKERAGE_AUTH_ID = process.env.SNAPTRADE_BROKERAGE_AUTH_ID;
+const USER_ID      = process.env.SNAPTRADE_USER_ID;
+const USER_SECRET  = process.env.SNAPTRADE_USER_SECRET;
+const ACCOUNT_ID   = process.env.SNAPTRADE_ACCOUNT_ID;
+
+// BROKERAGE_AUTH_ID is mutable — it can be refreshed at runtime after
+// step-up auth without needing a Railway env var redeploy.
+const AUTH_STATE_PATH = path.join(__dirname, "auth_state.json");
+let activeAuthId = process.env.SNAPTRADE_BROKERAGE_AUTH_ID || "";
+try {
+  const saved = JSON.parse(fs.readFileSync(AUTH_STATE_PATH, "utf8"));
+  if (saved && saved.brokerageAuthId) {
+    activeAuthId = saved.brokerageAuthId;
+    console.log("[QuickTrade] Loaded persisted auth ID from auth_state.json");
+  }
+} catch (_) { /* file doesn't exist yet — that's fine */ }
+
+function saveAuthId(id) {
+  activeAuthId = id;
+  try { fs.writeFileSync(AUTH_STATE_PATH, JSON.stringify({ brokerageAuthId: id })); }
+  catch (e) { console.warn("[QuickTrade] Could not persist auth ID:", e.message); }
+  console.log("[QuickTrade] ✅ activeAuthId updated and persisted:", id);
+}
 
 console.log("=== QuickTrade SnapTrade ENV CHECK ===");
-console.log("SNAPTRADE_CLIENT_ID:", CLIENT_ID ? "OK" : "MISSING");
-console.log("SNAPTRADE_CONSUMER_KEY:", CONSUMER_KEY ? "OK" : "MISSING");
-console.log("SNAPTRADE_USER_ID:", USER_ID ? "OK" : "MISSING");
-console.log("SNAPTRADE_USER_SECRET:", USER_SECRET ? "OK" : "MISSING");
-console.log("SNAPTRADE_ACCOUNT_ID:", ACCOUNT_ID ? "OK" : "MISSING");
-console.log("SNAPTRADE_BROKERAGE_AUTH_ID:", BROKERAGE_AUTH_ID ? "OK" : "MISSING");
+console.log("SNAPTRADE_CLIENT_ID:",        CLIENT_ID    ? "OK" : "MISSING");
+console.log("SNAPTRADE_CONSUMER_KEY:",     CONSUMER_KEY ? "OK" : "MISSING");
+console.log("SNAPTRADE_USER_ID:",          USER_ID      ? "OK" : "MISSING");
+console.log("SNAPTRADE_USER_SECRET:",      USER_SECRET  ? "OK" : "MISSING");
+console.log("SNAPTRADE_ACCOUNT_ID:",       ACCOUNT_ID   ? "OK" : "MISSING");
+console.log("SNAPTRADE_BROKERAGE_AUTH_ID:", activeAuthId ? "OK" : "MISSING");
 console.log("======================================");
 
 // ------------- INIT SNAPTRADE CLIENT -------------
@@ -86,8 +106,6 @@ app.use(
 
 // -------- Python Bot Spawner --------
 const { spawn, exec } = require("child_process");
-const path = require("path");
-const fs = require("fs");
 
 const activeBots = {};
 
@@ -398,6 +416,152 @@ app.get("/api/trailing-stops", (req, res) => {
   res.json({ ok: true, stops: trailingStopMgr.getActive() });
 });
 
+// ------------- DIAGNOSE AUTH STATE -------------
+// Returns all brokerage authorizations with their IDs so we can see
+// if the stored BROKERAGE_AUTH_ID is stale / disabled / mismatched.
+// ------------- STEP-UP AUTH VERIFY (fresh portal — forces full WealthSimple login + MFA) -------------
+// Different from connect-portal: NO reconnect param → WealthSimple must do a
+// complete fresh login, which includes their step-up trading verification.
+// After user completes it, call /api/snaptrade/refresh-auth to auto-save the new auth ID.
+app.get("/api/snaptrade/stepup-verify", async (req, res) => {
+  try {
+    if (!CLIENT_ID || !CONSUMER_KEY || !USER_ID || !USER_SECRET) {
+      return res.status(500).json({ ok: false, error: "Missing SnapTrade credentials." });
+    }
+    // NO reconnect param — force completely fresh WealthSimple login
+    const response = await snaptrade.authentication.loginSnapTradeUser({
+      userId:                  USER_ID,
+      userSecret:              USER_SECRET,
+      connectionType:          "trade",
+      broker:                  "WEALTHSIMPLETRADE",
+      darkMode:                true,
+      showCloseButton:         true,
+      connectionPortalVersion: "v4",
+    });
+    console.log("[QuickTrade] stepup-verify portal created:", response.data?.redirectURI);
+    res.json({
+      ok:          true,
+      redirectURI: response.data?.redirectURI,
+      sessionId:   response.data?.sessionId,
+    });
+  } catch (err) {
+    console.error("[QuickTrade] stepup-verify error:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ------------- REFRESH AUTH ID (auto-detect new auth after step-up verify) -------------
+// Call this after user completes the stepup-verify portal.
+// Finds the newest non-disabled brokerage auth and saves it so future orders work.
+app.post("/api/snaptrade/refresh-auth", async (req, res) => {
+  try {
+    const listResp = await snaptrade.connections.listBrokerageAuthorizations({
+      userId:     USER_ID,
+      userSecret: USER_SECRET,
+    });
+    const all = Array.isArray(listResp.data) ? listResp.data : [];
+
+    // Prefer active (non-disabled) auths, pick the most recently created one
+    const active = all
+      .filter(c => !c.disabled)
+      .sort((a, b) => new Date(b.created_date || 0) - new Date(a.created_date || 0));
+
+    if (active.length === 0) {
+      return res.status(400).json({ ok: false, error: "No active brokerage connections found. Complete the verification portal first." });
+    }
+
+    const newId = active[0].id;
+    saveAuthId(newId);
+
+    console.log("[QuickTrade] refresh-auth: new activeAuthId =", newId);
+    res.json({ ok: true, newAuthId: newId, broker: active[0].brokerage?.slug || "?" });
+  } catch (err) {
+    console.error("[QuickTrade] refresh-auth error:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/snaptrade/diagnose", async (req, res) => {
+  try {
+    const resp = await snaptrade.connections.listBrokerageAuthorizations({
+      userId: USER_ID,
+      userSecret: USER_SECRET,
+    });
+    const list = Array.isArray(resp.data) ? resp.data : [];
+    const connections = list.map((c) => ({
+      id:            c.id,
+      type:          c.type,
+      disabled:      !!c.disabled,
+      created_date:  c.created_date || null,
+      broker:        c.brokerage?.slug || c.brokerage?.name || "?",
+    }));
+    const configuredId   = activeAuthId || "(not set)";
+    const configuredOk   = list.some((c) => c.id === activeAuthId && !c.disabled);
+    console.log("[QuickTrade] /diagnose — configured:", configuredId, "| ok:", configuredOk);
+    res.json({ ok: true, configuredId, configuredOk, connections });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ------------- FULL RESET (nuclear option) -------------
+// Deletes ALL brokerage authorizations and opens a fresh connect portal.
+// Use this when reconnect doesn't clear step-up auth.
+// After completing the portal the user must copy the new auth ID from logs
+// and update SNAPTRADE_BROKERAGE_AUTH_ID in Railway env vars.
+app.post("/api/snaptrade/full-reset", async (req, res) => {
+  try {
+    console.log("[QuickTrade] FULL RESET — deleting all brokerage authorizations...");
+
+    // List all
+    const listResp = await snaptrade.connections.listBrokerageAuthorizations({
+      userId: USER_ID,
+      userSecret: USER_SECRET,
+    });
+    const all = Array.isArray(listResp.data) ? listResp.data : [];
+    const deleted = [];
+
+    for (const c of all) {
+      try {
+        await snaptrade.connections.removeBrokerageAuthorization({
+          userId: USER_ID,
+          userSecret: USER_SECRET,
+          authorizationId: c.id,
+        });
+        deleted.push(c.id);
+        console.log("[QuickTrade] FULL RESET — deleted auth:", c.id);
+      } catch (delErr) {
+        console.warn("[QuickTrade] FULL RESET — could not delete", c.id, ":", delErr.message);
+      }
+    }
+
+    // Open fresh portal (no reconnect — this is a clean slate)
+    const portalResp = await snaptrade.authentication.loginSnapTradeUser({
+      userId: USER_ID,
+      userSecret: USER_SECRET,
+      connectionType: "trade",
+      broker: "WEALTHSIMPLETRADE",
+      darkMode: true,
+      showCloseButton: true,
+      connectionPortalVersion: "v4",
+    });
+
+    console.log("[QuickTrade] FULL RESET — fresh portal:", portalResp.data?.redirectURI);
+    console.log("[QuickTrade] FULL RESET — after completing the portal, update SNAPTRADE_BROKERAGE_AUTH_ID in Railway with the new auth ID from /api/snaptrade/accounts");
+
+    res.json({
+      ok: true,
+      deleted,
+      redirectURI: portalResp.data?.redirectURI,
+      sessionId:   portalResp.data?.sessionId,
+      instructions: "Complete the portal, then call GET /api/snaptrade/accounts to find the new auth ID and update SNAPTRADE_BROKERAGE_AUTH_ID in Railway.",
+    });
+  } catch (err) {
+    console.error("[QuickTrade] FULL RESET error:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ------------- LIST CONNECTIONS (BROKERAGE AUTHORIZATIONS) -------------
 // ✅ Option B: backend endpoint your extension can call to see why trading is blocked
 // Uses: GET https://api.snaptrade.com/api/v1/authorizations :contentReference[oaicite:1]{index=1}
@@ -512,7 +676,6 @@ function mapOrderType(frontType) {
 function extractSafeError(err) {
   console.error("[QuickTrade] RAW ERROR FROM SNAPTRADE:", err);
 
-  // 🔍 Special handling for SnapTrade "inactive security" (code 1146)
   try {
     const body =
       err?.responseBody ||
@@ -522,18 +685,59 @@ function extractSafeError(err) {
 
     const code = body?.code || body?.status_code || err?.code;
     const detail = body?.detail || err?.message || "";
+    const detailLower = String(detail || "").toLowerCase();
 
-    // If SnapTrade says the underlying security is inactive
-    if (String(code) === "1146" || /inactive as of/i.test(detail || "")) {
+    // ── Priority 1: Step-up / MFA authentication required ──────────────────
+    // Broker (e.g. WealthSimple) requires a re-authentication before trading.
+    // This sometimes arrives as code 1146 but the REAL cause is MFA, not an
+    // inactive symbol — so we must check the detail text FIRST.
+    if (
+      /step.?up\s*auth/i.test(detail) ||
+      /step-up/i.test(detail) ||
+      /mfa.*(required|needed)/i.test(detail) ||
+      /2fa.*(required|needed)/i.test(detail) ||
+      /additional.*auth/i.test(detail) ||
+      /authentication.*required.*place/i.test(detail)
+    ) {
       return (
-        "QT_BACKEND_ERROR: This symbol is currently marked INACTIVE " +
-        "on SnapTrade's side, so QuickTrade can't send live orders for it. " +
-        "You may still be able to trade it directly in your broker's app. " +
-        (detail ? ` (${detail}) (code 1146)` : " (code 1146)")
+        "QT_BACKEND_ERROR: WealthSimple is requiring step-up verification before this order can go through via the API." +
+        (code ? ` (code ${code})` : "")
       );
     }
 
-    // Generic SnapTrade error with detail
+    // ── Priority 2: Code 1063 — WealthSimple can't obtain real-time data ───
+    // This fires when WealthSimple is unable to price the order impact.
+    // Common causes: market closed, ticker in maintenance, or stale session.
+    if (String(code) === "1063" || /failed to obtain data/i.test(detailLower)) {
+      const clock = getMarketClock();
+      const sessionHint = clock.isClosed
+        ? " The market is currently CLOSED — WealthSimple cannot price order impact outside trading hours. Try again during regular hours (9:30–4:00 PM ET), or place a Day Limit order."
+        : " Try clicking Connect to refresh your brokerage session, then retry your order.";
+      return (
+        "QT_BACKEND_ERROR: WealthSimple couldn't obtain real-time data to validate this order (code 1063)." +
+        sessionHint
+      );
+    }
+
+    // ── Priority 3: Inactive / delisted security (code 1146) ───────────────
+    // Only show this when the detail actually refers to an inactive security,
+    // NOT when it's a step-up auth issue that happens to share code 1146.
+    if (
+      String(code) === "1146" ||
+      /inactive as of/i.test(detailLower) ||
+      /security.*inactive/i.test(detailLower) ||
+      /symbol.*inactive/i.test(detailLower)
+    ) {
+      return (
+        "QT_BACKEND_ERROR: This symbol is currently marked INACTIVE " +
+        "on SnapTrade's side, so QuickTrade can't send live orders for it. " +
+        "You may still be able to trade it directly in your broker's app." +
+        (detail ? ` (${detail})` : "") +
+        (code ? ` (code ${code})` : "")
+      );
+    }
+
+    // ── Generic SnapTrade error with detail ─────────────────────────────────
     if (body && detail) {
       let safeMessage = `QT_BACKEND_ERROR: ${detail}`;
       if (code) {
@@ -564,13 +768,15 @@ function formatMoney(num) {
 /**
  * Convert "now" to America/New_York and figure out:
  * - is regular session open
- * - is pre-market / post-market
+ * - is pre-market / post-market / overnight
  * - recommended order type for frontend (market vs limit)
+ * - snapTradeSession: the value to pass as trading_session in SnapTrade payloads
  *
- * We assume US equities for now (NYSE/NASDAQ):
- *  - Regular: 09:30–16:00 ET
- *  - Pre:     08:00–09:30 ET
- *  - Post:    16:00–20:00 ET
+ * WealthSimple trading sessions (US equities only):
+ *  - Overnight : 20:00 ET (Fri/weekday) – 04:00 ET (next day)
+ *  - Pre-market: 04:00 – 09:30 ET
+ *  - Regular   : 09:30 – 16:00 ET
+ *  - Post-market: 16:00 – 20:00 ET
  */
 function getMarketClock() {
   const now = new Date();
@@ -579,17 +785,20 @@ function getMarketClock() {
   });
   const nyNow = new Date(nyString);
 
-  const day = nyNow.getDay(); // 0=Sun, 6=Sat
+  const day = nyNow.getDay(); // 0=Sun, 1=Mon … 6=Sat
   const isWeekday = day >= 1 && day <= 5;
+  // Sunday night counts as overnight for Monday's pre-market
+  const isSundayNight = day === 0;
 
   const hours = nyNow.getHours();
   const minutes = nyNow.getMinutes();
   const totalMin = hours * 60 + minutes;
 
-  const PRE_OPEN = 8 * 60; // 08:00
-  const REG_OPEN = 9 * 60 + 30; // 09:30
-  const REG_CLOSE = 16 * 60; // 16:00
-  const POST_CLOSE = 20 * 60; // 20:00
+  const OVERNIGHT_START = 20 * 60; // 20:00 — overnight opens
+  const PRE_OPEN        =  4 * 60; // 04:00 — pre-market opens
+  const REG_OPEN        =  9 * 60 + 30; // 09:30
+  const REG_CLOSE       = 16 * 60; // 16:00
+  const POST_CLOSE      = 20 * 60; // 20:00 — post-market closes / overnight opens
 
   let session = "CLOSED";
   let isOpenRegular = false;
@@ -605,21 +814,38 @@ function getMarketClock() {
     } else if (totalMin >= REG_CLOSE && totalMin < POST_CLOSE) {
       session = "POST";
       isExtended = true;
+    } else {
+      // Before 04:00 or at/after 20:00 on a weekday = overnight
+      session = "OVERNIGHT";
+      isExtended = true;
     }
+  } else if (isSundayNight && totalMin >= OVERNIGHT_START) {
+    // Sunday 20:00–midnight is overnight for Monday
+    session = "OVERNIGHT";
+    isExtended = true;
   }
 
   const isClosed = !isOpenRegular && !isExtended;
 
+  // Map to the trading_session value WealthSimple/SnapTrade expects
+  const snapTradeSession =
+    session === "REGULAR"  ? "REGULAR" :
+    session === "PRE"      ? "PRE_MARKET" :
+    session === "POST"     ? "AFTER_MARKET" :
+    session === "OVERNIGHT"? "AFTER_MARKET" :  // WealthSimple treats overnight as after-market
+    "REGULAR"; // fallback for CLOSED (orders queue for next session)
+
   // Frontend can use this to auto-toggle order type:
   //  - REGULAR  -> market + limit allowed
-  //  - PRE/POST -> limit recommended
+  //  - PRE/POST/OVERNIGHT -> limit only
   const recommendedOrderType = isOpenRegular ? "market" : "limit";
 
   return {
     exchange: "US_EQUITIES",
     timeZone: "America/New_York",
     isoNow: nyNow.toISOString(),
-    session, // "REGULAR" | "PRE" | "POST" | "CLOSED"
+    session,          // "REGULAR" | "PRE" | "POST" | "OVERNIGHT" | "CLOSED"
+    snapTradeSession, // value to pass as trading_session to SnapTrade
     isOpenRegular,
     isExtended,
     isClosed,
@@ -805,11 +1031,16 @@ async function placeEquityOrder({
   const snapAction = String(action).toUpperCase() === "BUY" ? "BUY" : "SELL";
   const snapOrderType = mapOrderType(orderType);
 
-  // 🔔 Market clock: block Market orders outside regular hours
+  // 🔔 Market clock: block Market orders outside regular hours.
+  // Stop/StopLimit orders are allowed in extended hours (they queue and trigger
+  // when the market session opens and price is hit).
   const clock = getMarketClock();
   if (!clock.isOpenRegular && snapOrderType === "Market") {
     throw new Error(
-      "Market orders are only allowed during regular hours (09:30–16:00 ET). Switch to a Limit order."
+      "Market orders are only allowed during regular hours (09:30–16:00 ET). " +
+      (clock.isExtended
+        ? `Market is in ${clock.session} session — switch to a Limit order.`
+        : "Market is CLOSED — switch to a Limit order.")
     );
   }
 
@@ -836,12 +1067,31 @@ async function placeEquityOrder({
   // Resolve symbol to UUID (automatically filtered for North American exchanges)
   const symbolId = await resolveQuoteSymbolId(symbol);
 
-  // Simple mapping for trading_session:
-  //  - REGULAR -> "REGULAR"
-  //  - PRE/POST -> still "REGULAR" for now (SnapTrade will route if supported)
-  const tradingSession = clock.isOpenRegular ? "REGULAR" : "REGULAR";
+  // Map current market session to the SnapTrade trading_session field.
+  // This tells WealthSimple which session book to route the order to:
+  //   REGULAR     -> regular 09:30-16:00 session
+  //   PRE_MARKET  -> 04:00-09:30 pre-market (limit only)
+  //   AFTER_MARKET-> 16:00-20:00 post + overnight (limit only)
+  const tradingSession = clock.snapTradeSession;
 
-  const finalAccountId = accountId || ACCOUNT_ID;
+  // Use the accountId from the request if it matches our configured account.
+  // If it's stale (from extension cache after a connection reset), fall back
+  // to the env var ACCOUNT_ID so orders don't fail with "Account not found".
+  const finalAccountId = (accountId && accountId === ACCOUNT_ID)
+    ? accountId
+    : ACCOUNT_ID;
+
+  if (accountId && accountId !== ACCOUNT_ID) {
+    console.warn(
+      `[QuickTrade] Incoming accountId (${accountId}) doesn't match configured ACCOUNT_ID (${ACCOUNT_ID}) — using env var.`
+    );
+  }
+
+
+  // WealthSimple only accepts "Day" or "FOK" for time_in_force.
+  // The trading_session field (PRE_MARKET / AFTER_MARKET / REGULAR) is what
+  // routes the order to the correct extended-hours book on their side.
+  const timeInForce = "Day";
 
   const payload = {
     userId: USER_ID,
@@ -850,7 +1100,7 @@ async function placeEquityOrder({
     action: snapAction,
     universal_symbol_id: symbolId,
     order_type: snapOrderType,
-    time_in_force: "Day",
+    time_in_force: timeInForce,
     trading_session: tradingSession,
     units,
   };
@@ -864,14 +1114,75 @@ async function placeEquityOrder({
 
   console.log("[QuickTrade] placeEquityOrder payload:", JSON.stringify(payload, null, 2));
 
-  const orderResponse = await snaptrade.trading.placeForceOrder(payload);
+  // ── TWO-STEP ORDER FLOW ────────────────────────────────────────────────
+  // WealthSimple rejects placeForceOrder (step-up auth / code 1146) because
+  // it bypasses their normal confirmation flow.  The correct approach is:
+  //   Step 1: getOrderImpact  → get a tradeId + order preview
+  //   Step 2: placeOrder      → confirm using that tradeId
+  // This is the standard flow WealthSimple expects for API trading.
+  //
+  // EXCEPTION — code 1063 "failed to obtain data":
+  //   WealthSimple can't compute order impact when it has no real-time quote
+  //   (e.g. after-hours, ticker in brief data outage).  In that case we fall
+  //   back directly to placeForceOrder so Day Limit orders can still be
+  //   queued and will execute when the market opens.
+  // ──────────────────────────────────────────────────────────────────────
 
-  console.log(
-    "[QuickTrade] SnapTrade order success:",
-    orderResponse.data || orderResponse
-  );
+  // Step 1 — get order impact (validates the order and returns a tradeId)
+  let impactResp, impactData, tradeId;
+  try {
+    impactResp = await snaptrade.trading.getOrderImpact(payload);
+    impactData  = impactResp.data || impactResp;
+    tradeId =
+      impactData?.trade?.id ||
+      impactData?.id       ||
+      impactData?.tradeId  ||
+      null;
+  } catch (impactErr) {
+    // Extract error code from SnapTrade SDK error shape
+    const impactBody =
+      impactErr?.responseBody ||
+      impactErr?.body         ||
+      impactErr?.response?.data ||
+      null;
+    const impactCode = String(impactBody?.code || impactBody?.status_code || impactErr?.code || "");
 
-  return orderResponse.data || orderResponse;
+    if (impactCode === "1063" || /failed to obtain data/i.test(impactBody?.detail || "")) {
+      // Market-data unavailable — skip impact check and force-place the limit order
+      console.warn(
+        "[QuickTrade] getOrderImpact code 1063 (no real-time data) — falling back to placeForceOrder.",
+        "Order type:", snapOrderType, "| Symbol:", symbol
+      );
+      // Market orders are already blocked above; only Limit/Stop reach here after-hours
+      const forceResp = await snaptrade.trading.placeForceOrder(payload);
+      console.log("[QuickTrade] placeForceOrder (1063 fallback) success:", forceResp.data || forceResp);
+      return forceResp.data || forceResp;
+    }
+
+    // Re-throw any other impact error so it surfaces normally
+    throw impactErr;
+  }
+
+  if (!tradeId) {
+    // Fallback: some brokers return impact but no tradeId — try force as last resort
+    console.warn("[QuickTrade] getOrderImpact returned no tradeId — falling back to placeForceOrder");
+    const forceResp = await snaptrade.trading.placeForceOrder(payload);
+    console.log("[QuickTrade] placeForceOrder (fallback) success:", forceResp.data || forceResp);
+    return forceResp.data || forceResp;
+  }
+
+  console.log("[QuickTrade] Order impact OK — tradeId:", tradeId, "| estimated:", JSON.stringify(impactData?.estimated_commissions || impactData?.trade || {}));
+
+  // Step 2 — confirm and place the order using the tradeId
+  const placeResp = await snaptrade.trading.placeOrder({
+    tradeId,
+    userId: USER_ID,
+    userSecret: USER_SECRET,
+  });
+
+  console.log("[QuickTrade] SnapTrade order placed (two-step):", placeResp.data || placeResp);
+
+  return placeResp.data || placeResp;
 }
 // ------------- SNAPTRADE USER REGISTRATION -------------
 
@@ -952,15 +1263,42 @@ app.get("/api/snaptrade/connect-portal", async (req, res) => {
       });
     }
 
-    // Allow version override via ?version=v3 or ?version=v4 for testing
-    const portalVersion = req.query.version || "v3";
+    // ── KEY FIX ────────────────────────────────────────────────────────────
+    // If we already have a brokerage auth ID (i.e. WealthSimple is already
+    // linked), use `reconnect` so SnapTrade re-authenticates the *existing*
+    // connection.  This is what actually clears the step-up (MFA) requirement
+    // on the active trading account.
+    //
+    // Creating a NEW connection (no `reconnect`) does NOT clear step-up auth
+    // on the old connection — it just creates a parallel orphaned connection
+    // that is never used for trading.
+    // ──────────────────────────────────────────────────────────────────────
 
-    const response = await snaptrade.authentication.loginSnapTradeUser({
+    const loginParams = {
       userId: USER_ID,
       userSecret: USER_SECRET,
       connectionType: "trade",
       broker: "WEALTHSIMPLETRADE",
-    });
+      darkMode: true,
+      showCloseButton: true,
+      connectionPortalVersion: "v4",
+    };
+
+    if (activeAuthId) {
+      // Reconnect the existing auth → clears step-up auth
+      loginParams.reconnect = activeAuthId;
+      console.log(
+        "[QuickTrade] connect-portal: using RECONNECT mode (existing auth):",
+        activeAuthId
+      );
+    } else {
+      // First-time setup — create a fresh connection
+      console.log(
+        "[QuickTrade] connect-portal: no activeAuthId — creating new connection"
+      );
+    }
+
+    const response = await snaptrade.authentication.loginSnapTradeUser(loginParams);
 
     console.log("[QuickTrade] Created connection portal:", response.data);
 
@@ -968,6 +1306,7 @@ app.get("/api/snaptrade/connect-portal", async (req, res) => {
       ok: true,
       redirectURI: response.data.redirectURI,
       sessionId: response.data.sessionId,
+      mode: BROKERAGE_AUTH_ID ? "reconnect" : "new",
     });
   } catch (err) {
     console.error(
@@ -978,6 +1317,7 @@ app.get("/api/snaptrade/connect-portal", async (req, res) => {
     res.status(500).json({ ok: false, error: safeMessage });
   }
 });
+
 
 // alias route specifically called by your frontend / manual tests
 app.get("/api/snaptrade/connect-wealthsimple", async (req, res) => {
@@ -990,7 +1330,7 @@ app.get("/api/snaptrade/connect-wealthsimple", async (req, res) => {
       });
     }
 
-    if (!BROKERAGE_AUTH_ID) {
+    if (!activeAuthId) {
       return res.status(500).json({
         ok: false,
         error:
@@ -1001,7 +1341,7 @@ app.get("/api/snaptrade/connect-wealthsimple", async (req, res) => {
     const response = await snaptrade.authentication.loginSnapTradeUser({
       userId: USER_ID,
       userSecret: USER_SECRET,
-      reconnect: BROKERAGE_AUTH_ID,
+      reconnect: activeAuthId,
       connectionType: "trade",
       darkMode: true,
       showCloseButton: true,
@@ -1042,7 +1382,7 @@ app.delete("/api/snaptrade/connection", async (req, res) => {
     }
 
     // Use the auth ID from the request body, or fall back to the .env value
-    const authId = (req.body && req.body.authorizationId) || BROKERAGE_AUTH_ID;
+    const authId = (req.body && req.body.authorizationId) || activeAuthId;
 
     if (!authId) {
       return res.status(400).json({
@@ -1497,43 +1837,9 @@ app.post("/api/order", async (req, res) => {
       dbg("AUTO_LIMIT_COMPUTED", { computed: limitToSend });
     }
 
-    // ✅ For limit BUY: ensure price >= real ask so it fills immediately
-    // For limit SELL: ensure price <= real bid
-    if (
-      String(orderType).toLowerCase() === "limit" &&
-      limitToSend != null &&
-      String(limitToSend).toUpperCase() !== "AUTO"
-    ) {
-      try {
-        const symbolId = await resolveQuoteSymbolId(symbol);
-        const quotesResp = await snaptrade.trading.getUserAccountQuotes({
-          userId: USER_ID,
-          userSecret: USER_SECRET,
-          accountId: ACCOUNT_ID,
-          symbols: symbolId,
-        });
-        const qData = quotesResp.data || quotesResp;
-        const q = Array.isArray(qData) && qData.length > 0 ? qData[0] : null;
-        const realAsk = q?.ask_price ?? q?.raw?.ask_price ?? null;
-        const realBid = q?.bid_price ?? q?.raw?.bid_price ?? null;
+    // Note: limit price is trusted from the frontend — it already computes
+    // the correct price using ask + buffer. No extra quote fetch needed here.
 
-        if (side.toUpperCase() === "BUY" && realAsk && realAsk > 0) {
-          const askPlus = +(realAsk * 1.002).toFixed(2); // ask + 0.2% cushion
-          if (Number(limitToSend) < askPlus) {
-            dbg("LIMIT_BUMPED_TO_ASK", { was: limitToSend, realAsk, newLimit: askPlus });
-            limitToSend = askPlus;
-          }
-        } else if (side.toUpperCase() === "SELL" && realBid && realBid > 0) {
-          const bidMinus = +(realBid * 0.998).toFixed(2);
-          if (Number(limitToSend) > bidMinus) {
-            dbg("LIMIT_LOWERED_TO_BID", { was: limitToSend, realBid, newLimit: bidMinus });
-            limitToSend = bidMinus;
-          }
-        }
-      } catch (qErr) {
-        dbg("QUOTE_FETCH_SKIP", { error: qErr.message });
-      }
-    }
 
     // ---------------- NORMALIZE LIMIT PRICE TO BROKER TICK ----------------
     if (
