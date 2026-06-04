@@ -1,101 +1,86 @@
 // market/finnhubStream.js
-// Real-time market data via Finnhub WebSocket + REST polling
-const WebSocket = require("ws");
+// ─────────────────────────────────────────────────────────────────────────────
+// Price feed — reads from QuickTradeScanner's live WS cache via /api/price
+//
+// WHY: The scanner already has a Finnhub WebSocket connection maintaining
+// real-time prices for every subscribed symbol. Opening a SECOND Finnhub WS
+// from this backend burns the shared API key quota (300/min REST + WS limits),
+// triggering 429s on both services and the 24-hour ban.
+//
+// The scanner exposes /api/price?sym=AAPL which returns the live WS price with
+// ZERO additional Finnhub calls. We poll that endpoint instead.
+// ─────────────────────────────────────────────────────────────────────────────
 
-const WS_URL = "wss://ws.finnhub.io";
-let ws;
-let apiKey = "";
-let subscribedSymbols = [];
-let onMsgCallback = null;
-let reconnectTimer = null;
-let reconnectDelay = 3000; // start at 3s, backs off on 429
+const SCANNER_URL = process.env.SCANNER_URL || "https://quicktradescanner-production.up.railway.app";
+const POLL_INTERVAL_MS = 2000;   // poll scanner every 2s — matches extension's quote refresh rate
+
+let subscribedSymbols  = [];
+let onMsgCallback      = null;
+let pollTimer          = null;
+let _started           = false;
 
 function start(key, onMessages) {
-  apiKey = key;
+  // key is unused — we no longer talk to Finnhub directly
   onMsgCallback = onMessages;
-  connect();
+  console.log(`[PriceFeed] Using QuickTradeScanner price cache — ${SCANNER_URL}/api/price`);
+  _startPolling();
 }
 
-function connect() {
-  if (reconnectTimer) clearTimeout(reconnectTimer);
+function _startPolling() {
+  if (pollTimer) return;   // already running
+  _poll();
+}
 
-  ws = new WebSocket(`${WS_URL}?token=${apiKey}`);
-
-  ws.on("open", () => {
-    console.log("[Finnhub WS] Connected");
-    reconnectDelay = 3000; // reset backoff on success
-    // Re-subscribe all symbols
-    subscribedSymbols.forEach(s => {
-      ws.send(JSON.stringify({ type: "subscribe", symbol: s }));
-    });
-  });
-
-  ws.on("message", (raw) => {
-    try {
-      const msg = JSON.parse(raw.toString());
-      if (msg.type === "trade" && Array.isArray(msg.data)) {
-        const converted = msg.data.map(d => ({
-          T: "t",
-          S: d.s,
-          p: d.p,
-          s: d.v,
-          t: new Date(d.t).toISOString(),
-        }));
-        if (onMsgCallback) onMsgCallback(converted);
+async function _poll() {
+  if (subscribedSymbols.length > 0) {
+    for (const sym of subscribedSymbols) {
+      try {
+        const fetch   = (await import("node-fetch")).default;
+        const res     = await fetch(`${SCANNER_URL}/api/price?sym=${sym}`, { signal: AbortSignal.timeout(3000) });
+        const data    = await res.json();
+        const price   = data.price || 0;
+        if (price > 0 && onMsgCallback) {
+          // Emit in the same format the rest of the backend expects
+          onMsgCallback([{
+            T:    "t",
+            S:    sym,
+            p:    price,
+            s:    0,
+            t:    new Date().toISOString(),
+            bid:  data.bid   || price,
+            ask:  data.ask   || price,
+            chg:  data.chg   || 0,
+          }]);
+        }
+      } catch (e) {
+        // silent — scanner may be restarting, will retry next poll
       }
-    } catch (e) {
-      // ignore parse errors
     }
-  });
-
-  ws.on("close", () => {
-    console.log(`[Finnhub WS] Disconnected, reconnecting in ${reconnectDelay / 1000}s...`);
-    reconnectTimer = setTimeout(connect, reconnectDelay);
-  });
-
-  ws.on("error", (err) => {
-    if (err.message && err.message.includes("429")) {
-      reconnectDelay = 86400000; // 24-hour backoff ban for hard 429 limits
-      console.warn(`[Finnhub WS] Rate limited (429) by API provider. Going into deep sleep for 24 hours before next reconnect attempt.`);
-    } else {
-      console.warn("[Finnhub WS] Error:", err.message);
-    }
-  });
+  }
+  pollTimer = setTimeout(_poll, POLL_INTERVAL_MS);
 }
 
 function subscribe(symbols) {
-  const newSymbols = symbols.filter(s => !subscribedSymbols.includes(s));
   subscribedSymbols = [...new Set([...subscribedSymbols, ...symbols])];
-
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    newSymbols.forEach(s => {
-      ws.send(JSON.stringify({ type: "subscribe", symbol: s }));
-    });
-  }
+  // No WS frames to send — scanner already has these subscribed
 }
 
-// REST quote fetch for bid/ask data (Finnhub WS only sends trades)
+// REST quote — also proxied through scanner to avoid Finnhub REST calls from backend
 async function fetchQuote(symbol) {
   try {
     const fetch = (await import("node-fetch")).default;
-    const url = `https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${apiKey}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    // c=current, h=high, l=low, o=open, pc=previous close, d=change, dp=change%
+    const res   = await fetch(`${SCANNER_URL}/api/price?sym=${symbol}`, { signal: AbortSignal.timeout(5000) });
+    const data  = await res.json();
+    const price = data.price || 0;
     return {
-      T: "q",
-      S: symbol,
-      bp: data.c - 0.01,  // simulated bid (current - 1 cent)
-      ap: data.c + 0.01,  // simulated ask (current + 1 cent)
-      bs: 100,
-      as: 100,
-      price: data.c,
-      high: data.h,
-      low: data.l,
-      open: data.o,
-      prevClose: data.pc,
-      change: data.d,
-      changePct: data.dp,
+      T:         "q",
+      S:         symbol,
+      bp:        data.bid   || price - 0.01,
+      ap:        data.ask   || price + 0.01,
+      bs:        100,
+      as:        100,
+      price,
+      changePct: data.chg   || 0,
     };
   } catch (e) {
     return null;
