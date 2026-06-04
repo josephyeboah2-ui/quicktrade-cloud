@@ -873,6 +873,7 @@ app.get("/api/market-clock", (req, res) => {
  * trading symbol (e.g. SIS → SIS.TO, VAB → VAB.TO, etc).
  */
 const symbolCache = new Map();
+const quoteSymbolCache = new Map(); // cache: raw symbol → universal_symbol_id
 
 // Exchange priority order for WealthSimple via SnapTrade.
 // WealthSimple trades US equities + Canadian equities only.
