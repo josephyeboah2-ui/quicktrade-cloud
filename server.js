@@ -1182,23 +1182,25 @@ async function placeEquityOrder({
     }
 
     if (impactCode === "1011" || /ambiguous/i.test(impactBody?.detail || "")) {
-      // Symbol maps to multiple instruments (e.g. listed on multiple exchanges).
-      // placeForceOrder resolves ambiguity BUT requires raw symbol string — NOT
-      // universal_symbol_id (which causes 1012 "Invalid input" if passed through).
+      // Symbol maps to multiple instruments on SnapTrade.
+      // Clear the cache so next attempt re-resolves fresh.
+      const upperSym = String(symbol || "").toUpperCase().trim();
+      quoteSymbolCache.delete(upperSym);
+
+      // Try placeForceOrder with universal_symbol_id ONLY (no raw symbol —
+      // passing both symbol + universal_symbol_id causes 1012 "Invalid input").
       console.warn(
-        "[QuickTrade] getOrderImpact code 1011 (ambiguous symbol) — retrying placeForceOrder with raw symbol.",
-        "Symbol:", symbol
+        "[QuickTrade] getOrderImpact 1011 — retrying placeForceOrder with UUID only. Symbol:", symbol, "UUID:", symbolId
       );
       const forcePayload = {
-        userId:          USER_ID,
-        userSecret:      USER_SECRET,
-        account_id:      finalAccountId,
-        action:          snapAction,
-        symbol:          symbol.toUpperCase(),   // raw ticker
-        universal_symbol_id: symbolId,           // UUID to disambiguate
-        order_type:      snapOrderType,
-        time_in_force:   timeInForce,
-        trading_session: tradingSession,
+        userId:              USER_ID,
+        userSecret:          USER_SECRET,
+        account_id:          finalAccountId,
+        action:              snapAction,
+        universal_symbol_id: symbolId,
+        order_type:          snapOrderType,
+        time_in_force:       timeInForce,
+        trading_session:     tradingSession,
         units,
       };
       if (snapOrderType === "Limit" || snapOrderType === "StopLimit") forcePayload.price = px;
