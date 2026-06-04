@@ -1161,18 +1161,44 @@ async function placeEquityOrder({
 
     if (impactCode === "1011" || /ambiguous/i.test(impactBody?.detail || "")) {
       // Symbol maps to multiple instruments (e.g. listed on multiple exchanges).
-      // placeForceOrder routes directly through the brokerage and resolves the ambiguity.
+      // placeForceOrder resolves ambiguity BUT requires raw symbol string — NOT
+      // universal_symbol_id (which causes 1012 "Invalid input" if passed through).
       console.warn(
-        "[QuickTrade] getOrderImpact code 1011 (ambiguous symbol) — falling back to placeForceOrder.",
-        "Symbol:", symbol, "| universal_symbol_id:", symbolId
+        "[QuickTrade] getOrderImpact code 1011 (ambiguous symbol) — retrying placeForceOrder with raw symbol.",
+        "Symbol:", symbol
       );
-      const forceResp = await snaptrade.trading.placeForceOrder(payload);
+      const forcePayload = {
+        userId:         USER_ID,
+        userSecret:     USER_SECRET,
+        account_id:     finalAccountId,
+        action:         snapAction,
+        symbol:         symbol.toUpperCase(),   // raw symbol — NOT universal_symbol_id
+        symbol_id:      symbolId,               // include both so SnapTrade can choose
+        order_type:     snapOrderType,
+        time_in_force:  timeInForce,
+        trading_session: tradingSession,
+        units,
+      };
+      if (snapOrderType === "Limit" || snapOrderType === "StopLimit") forcePayload.price = px;
+      if (snapOrderType === "Stop"  || snapOrderType === "StopLimit") forcePayload.stop  = sp;
+      const forceResp = await snaptrade.trading.placeForceOrder(forcePayload);
       console.log("[QuickTrade] placeForceOrder (1011 fallback) success:", forceResp.data || forceResp);
       return forceResp.data || forceResp;
     }
 
-    // Re-throw any other impact error so it surfaces normally
-    throw impactErr;
+    // SnapTrade 429 — wait 5s and retry once
+    if (impactCode === "429" || String(impactErr?.status || "") === "429") {
+      console.warn("[QuickTrade] SnapTrade 429 on getOrderImpact — retrying in 5s...");
+      await new Promise(r => setTimeout(r, 5000));
+      impactResp = await snaptrade.trading.getOrderImpact(payload);
+      impactData  = impactResp.data || impactResp;
+      tradeId = impactData?.trade?.id || impactData?.id || impactData?.tradeId || null;
+      if (!tradeId) throw new Error("SnapTrade 429 retry succeeded but no tradeId returned.");
+      // Fall through to placeOrder below
+    } else {
+      // Re-throw any other impact error so it surfaces normally
+      throw impactErr;
+    }
   }
 
   if (!tradeId) {
