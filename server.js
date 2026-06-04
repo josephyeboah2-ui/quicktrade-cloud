@@ -943,8 +943,8 @@ async function resolveQuoteSymbolId(rawSymbol) {
   const chosenExch = getExch(best);
   console.log(`[SymbolResolver] ${upper} → id=${best.id} exch=${chosenExch} sym=${best.symbol} (${candidates.length} candidates, ${pool.length} exact)`);
 
-  quoteSymbolCache.set(upper, best.id);
-  return best.id;
+  quoteSymbolCache.set(upper, { id: best.id, exchange: chosenExch });
+  return { id: best.id, exchange: chosenExch };
 }
 
 
@@ -1084,8 +1084,10 @@ async function placeEquityOrder({
     if (sp === null || isNaN(sp) || sp <= 0) throw new Error("StopLimit requires a valid stop price.");
   }
 
-  // Resolve symbol to UUID (automatically filtered for North American exchanges)
-  const symbolId = await resolveQuoteSymbolId(symbol);
+  // Resolve symbol to UUID + exchange (automatically filtered for North American exchanges)
+  const resolved  = await resolveQuoteSymbolId(symbol);
+  const symbolId  = resolved.id;
+  const symbolExchange = resolved.exchange;
 
   // Map current market session to the SnapTrade trading_session field.
   // This tells WealthSimple which session book to route the order to:
@@ -1188,14 +1190,14 @@ async function placeEquityOrder({
         "Symbol:", symbol
       );
       const forcePayload = {
-        userId:         USER_ID,
-        userSecret:     USER_SECRET,
-        account_id:     finalAccountId,
-        action:         snapAction,
-        symbol:         symbol.toUpperCase(),   // raw symbol — NOT universal_symbol_id
-        symbol_id:      symbolId,               // include both so SnapTrade can choose
-        order_type:     snapOrderType,
-        time_in_force:  timeInForce,
+        userId:          USER_ID,
+        userSecret:      USER_SECRET,
+        account_id:      finalAccountId,
+        action:          snapAction,
+        symbol:          symbol.toUpperCase(),   // raw ticker
+        universal_symbol_id: symbolId,           // UUID to disambiguate
+        order_type:      snapOrderType,
+        time_in_force:   timeInForce,
         trading_session: tradingSession,
         units,
       };
@@ -1691,7 +1693,7 @@ app.get("/api/quote/:symbol", async (req, res) => {
     ensureEnv();
 
     // Resolve to what SnapTrade expects (handles SIS -> SIS.TO etc.)
-    const symbolId = await resolveQuoteSymbolId(symbol);
+    const { id: symbolId } = await resolveQuoteSymbolId(symbol);
 
 const quotesResp = await snaptrade.trading.getUserAccountQuotes({
   userId: USER_ID,
@@ -1810,7 +1812,7 @@ app.post("/api/order", async (req, res) => {
 
   // ✅ MARKETABLE AUTO LIMIT: BUY >= ASK+tick, SELL <= BID-tick
   async function computeAutoLimit({ rawSymbol, side, fillAggression }) {
-    const symbolId = await resolveQuoteSymbolId(rawSymbol);
+    const { id: symbolId } = await resolveQuoteSymbolId(rawSymbol);
 
     const quotesResp = await snaptrade.trading.getUserAccountQuotes({
       userId: USER_ID,
