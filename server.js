@@ -700,7 +700,7 @@ function extractSafeError(err) {
       /authentication.*required.*place/i.test(detail)
     ) {
       return (
-        "QT_BACKEND_ERROR: WealthSimple is requiring step-up verification before this order can go through via the API." +
+        "QT_STEPUP_AUTH: WealthSimple requires step-up verification before this order can go through." +
         (code ? ` (code ${code})` : "")
       );
     }
