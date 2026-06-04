@@ -1254,17 +1254,34 @@ async function placeEquityOrder({
     // uses a different internal endpoint that doesn't require step-up verification.
     if (placeCode === "1146" || /step.?up/i.test(placeDetail)) {
       console.warn("[QuickTrade] placeOrder blocked by step-up auth (1146) — retrying with placeForceOrder...");
+
+      // Use brokerage_symbol_id from the impact response — this is WealthSimple's
+      // own internal symbol ID, fully unambiguous, eliminates 1012 "Invalid input".
+      const brokerageSymId =
+        impactData?.symbol?.brokerage_symbol_id ||
+        impactData?.trade?.symbol?.brokerage_symbol_id ||
+        null;
+
       const forcePayload = {
         userId:              USER_ID,
         userSecret:          USER_SECRET,
         account_id:          finalAccountId,
         action:              snapAction,
-        universal_symbol_id: symbolId,
         order_type:          snapOrderType,
         time_in_force:       timeInForce,
         trading_session:     tradingSession,
         units,
       };
+
+      // Prefer brokerage_symbol_id > universal_symbol_id for WealthSimple
+      if (brokerageSymId) {
+        forcePayload.brokerage_symbol_id = brokerageSymId;
+        console.log("[QuickTrade] 1146 forcePayload using brokerage_symbol_id:", brokerageSymId);
+      } else {
+        forcePayload.universal_symbol_id = symbolId;
+        console.log("[QuickTrade] 1146 forcePayload using universal_symbol_id:", symbolId);
+      }
+
       if (snapOrderType === "Limit" || snapOrderType === "StopLimit") forcePayload.price = px;
       if (snapOrderType === "Stop"  || snapOrderType === "StopLimit") forcePayload.stop  = sp;
       const forceResp = await snaptrade.trading.placeForceOrder(forcePayload);
