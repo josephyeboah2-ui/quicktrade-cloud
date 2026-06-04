@@ -1159,6 +1159,18 @@ async function placeEquityOrder({
       return forceResp.data || forceResp;
     }
 
+    if (impactCode === "1011" || /ambiguous/i.test(impactBody?.detail || "")) {
+      // Symbol maps to multiple instruments (e.g. listed on multiple exchanges).
+      // placeForceOrder routes directly through the brokerage and resolves the ambiguity.
+      console.warn(
+        "[QuickTrade] getOrderImpact code 1011 (ambiguous symbol) — falling back to placeForceOrder.",
+        "Symbol:", symbol, "| universal_symbol_id:", symbolId
+      );
+      const forceResp = await snaptrade.trading.placeForceOrder(payload);
+      console.log("[QuickTrade] placeForceOrder (1011 fallback) success:", forceResp.data || forceResp);
+      return forceResp.data || forceResp;
+    }
+
     // Re-throw any other impact error so it surfaces normally
     throw impactErr;
   }
