@@ -1306,7 +1306,7 @@ app.get("/api/snaptrade/connect-portal", async (req, res) => {
       ok: true,
       redirectURI: response.data.redirectURI,
       sessionId: response.data.sessionId,
-      mode: BROKERAGE_AUTH_ID ? "reconnect" : "new",
+      mode: activeAuthId ? "reconnect" : "new",
     });
   } catch (err) {
     console.error(
