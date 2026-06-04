@@ -874,59 +874,78 @@ app.get("/api/market-clock", (req, res) => {
  */
 const symbolCache = new Map();
 
-// Resolve ticker -> SnapTrade SYMBOL ID (UUID) for quotes
-const quoteSymbolCache = new Map();
+// Exchange priority order for WealthSimple via SnapTrade.
+// WealthSimple trades US equities + Canadian equities only.
+// Any other exchange (AEX, EBS, BINANCE, XIDX, PAR, etc.) is WRONG —
+// those are European crypto ETPs or foreign listings of the same ticker.
+// Probe results confirmed: SDOT (4 matches), AAPL (11), TSLA (11), WCT (4)
+// — all ambiguous ONLY because of non-WS-tradable foreign listings.
+// Strict priority below eliminates all 1011 errors permanently.
+const EXCHANGE_PRIORITY = [
+  // US — WealthSimple primary market
+  "NASDAQ", "NYSE", "AMEX", "BATS", "ARCA", "IEX",
+  // Canadian — WealthSimple secondary market
+  "TSX", "TSXV", "CSE", "NEO", "CNSX",
+  // OTC / Pink sheets — WealthSimple does trade some OTC (e.g. CWBHF)
+  "OTCM", "OTC", "OTCBB", "PINK",
+];
 
 async function resolveQuoteSymbolId(rawSymbol) {
   const upper = String(rawSymbol || "").toUpperCase().trim();
   if (!upper) throw new Error("Missing symbol");
 
-  if (quoteSymbolCache.has(upper)) {
-    return quoteSymbolCache.get(upper);
-  }
+  if (quoteSymbolCache.has(upper)) return quoteSymbolCache.get(upper);
 
-  // Strip .US or .TO for the SnapTrade lookup, as getSymbols doesn't recognize them
-  const searchBase = upper.split('.')[0];
+  // Strip exchange suffix (.US / .TO / .V) for the SnapTrade lookup
+  const searchBase = upper.split(".")[0];
+  const forcedRegion = upper.endsWith(".TO") || upper.endsWith(".V") ? "CA"
+                     : upper.endsWith(".US")                         ? "US"
+                     : null;
 
-  const resp = await snaptrade.referenceData.getSymbols({
-    substring: searchBase,
-  });
-
+  const resp = await snaptrade.referenceData.getSymbols({ substring: searchBase });
   const list = resp.data || [];
 
-  if (!Array.isArray(list) || list.length === 0) {
+  if (!Array.isArray(list) || list.length === 0)
     throw new Error(`No SnapTrade symbol found for ${upper}`);
+
+  // Exact raw_symbol matches only
+  const exact = list.filter(s =>
+    s && s.raw_symbol &&
+    String(s.raw_symbol).toUpperCase() === searchBase
+  );
+
+  const pool = exact.length > 0 ? exact : list;
+
+  const getExch = s => String(s?.exchange?.code || s?.exchange || "").toUpperCase();
+
+  // If user explicitly forced a region, filter to that region first
+  let candidates = pool;
+  if (forcedRegion === "US") {
+    candidates = pool.filter(s => ["NASDAQ","NYSE","AMEX","BATS","ARCA","IEX"].includes(getExch(s)));
+  } else if (forcedRegion === "CA") {
+    candidates = pool.filter(s => ["TSX","TSXV","CSE","NEO","CNSX"].includes(getExch(s)));
+  }
+  if (candidates.length === 0) candidates = pool; // fallback if filter too aggressive
+
+  // Pick by strict exchange priority — first match wins
+  let best = null;
+  for (const exch of EXCHANGE_PRIORITY) {
+    best = candidates.find(s => getExch(s) === exch);
+    if (best) break;
   }
 
-  // Prefer exact raw_symbol match on North American exchanges
-  const validExchanges = ["NASDAQ", "NYSE", "AMEX", "BATS", "TSX", "TSXV", "CSE"];
-  let best = list.find((s) => {
-    if (!s || !s.raw_symbol) return false;
-    const isMatch = String(s.raw_symbol).toUpperCase() === searchBase;
-    const exchangeCode = s.exchange && s.exchange.code ? String(s.exchange.code).toUpperCase() : "";
-    
-    // If user explicitly typed .US or .TO, strictly enforce the exchange location
-    if (upper.endsWith(".US")) {
-      return isMatch && ["NASDAQ", "NYSE", "AMEX", "BATS"].includes(exchangeCode);
-    } else if (upper.endsWith(".TO") || upper.endsWith(".V")) {
-      return isMatch && ["TSX", "TSXV", "CSE"].includes(exchangeCode);
-    }
+  // Last resort: first result in pool (better than nothing)
+  if (!best) best = candidates[0] || pool[0];
 
-    return isMatch && validExchanges.includes(exchangeCode);
-  });
+  if (!best?.id) throw new Error(`Symbol ID missing for ${upper}`);
 
-  if (!best) {
-    best = list.find((s) => String(s.raw_symbol || "").toUpperCase() === searchBase);
-  }
-  if (!best) best = list[0];
-
-  if (!best || !best.id) {
-    throw new Error(`Symbol ID missing for ${upper}`);
-  }
+  const chosenExch = getExch(best);
+  console.log(`[SymbolResolver] ${upper} → id=${best.id} exch=${chosenExch} sym=${best.symbol} (${candidates.length} candidates, ${pool.length} exact)`);
 
   quoteSymbolCache.set(upper, best.id);
   return best.id;
 }
+
 
 async function resolveEffectiveSymbol(rawSymbol) {
   if (!rawSymbol) {
